@@ -4,7 +4,7 @@ import typing as _t
 from OpenSSL import SSL
 
 from ..makefile import StreamReader, StreamWriter
-from . import Adapter
+from . import Adapter, SNIMap, SNISite
 
 ssl_conn_type: _t.Type[SSL.Connection]
 
@@ -37,6 +37,7 @@ class pyOpenSSLAdapter(Adapter):
         | bytes
         | str
         | None = ...,
+        sni: SNIMap | _c.Mapping[str, SNISite] | None = ...,
     ) -> None: ...
     def wrap(self, sock): ...
     def _password_callback(

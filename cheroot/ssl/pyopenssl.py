@@ -75,7 +75,18 @@ from .. import (
     server as cheroot_server,
 )
 from ..makefile import StreamReader, StreamWriter
-from . import Adapter
+from . import Adapter, SNIRejected
+
+
+def _verify_client_cert_callback(
+    conn,
+    cert,
+    error_num,
+    error_depth,
+    preverify_ok,
+):
+    """Accept client certificates verified by OpenSSL."""
+    return preverify_ok
 
 
 class SSLFileobjectMixin:
@@ -202,6 +213,8 @@ class SSLConnectionProxyMeta:
             'getsockopt',
             'setsockopt',
             'makefile',
+            'do_handshake',
+            'get_servername',
             'get_app_data',
             'set_app_data',
             'state_string',
@@ -310,6 +323,16 @@ class pyOpenSSLAdapter(Adapter):
     private_key_password = None
     """Optional passphrase for password protected private key."""
 
+    sni = None
+    """Optional :py:class:`~cheroot.ssl.SNIMap` with per-site TLS
+    configurations selected via SNI during the handshake.
+
+    Note: unlike the builtin adapter, the WSGI environ is computed
+    once and does not reflect per-connection SNI or client
+    certificate details. Rejected SNI names abort the handshake and
+    surface a logged traceback via :func:`sys.excepthook` (a
+    pyOpenSSL limitation)."""
+
     def __init__(
         self,
         certificate,
@@ -318,6 +341,7 @@ class pyOpenSSLAdapter(Adapter):
         ciphers=None,
         *,
         private_key_password=None,
+        sni=None,
     ):
         """Initialize OpenSSL Adapter instance."""
         if SSL is None:
@@ -329,10 +353,85 @@ class pyOpenSSLAdapter(Adapter):
             certificate_chain,
             ciphers,
             private_key_password=private_key_password,
+            sni=sni,
         )
 
         self.context = self.get_context()
+        self._sni_contexts = {}
+        self._sni_enforce_client_cert = False
+        if self.sni is not None:
+            for hostname, site in self.sni.items():
+                self._sni_contexts[hostname] = self._get_sni_context(site)
+            self.context.set_tlsext_servername_callback(
+                self._sni_servername_callback,
+            )
+            self._upgrade_verify_mode_for_sni()
+            self._sni_enforce_client_cert = any(
+                site.client_verify_mode == 'required'
+                for _hostname, site in self.sni.items()
+            )
         self._environ = self.get_environ()
+
+    def _upgrade_verify_mode_for_sni(self):
+        """Make the default context request client certificates.
+
+        OpenSSL keeps the verify flags of the initial context when
+        the context is switched via SNI, so the default context must
+        ask for client certificates if any site wants them. Per-site
+        ``'required'`` policies are enforced after the handshake in
+        :meth:`wrap`.
+        """
+        wants_client_certs = any(
+            site.client_verify_mode != 'none'
+            for _hostname, site in self.sni.items()
+        )
+        if (
+            wants_client_certs
+            and self.context.get_verify_mode() == SSL.VERIFY_NONE
+        ):
+            self.context.set_verify(
+                SSL.VERIFY_PEER,
+                _verify_client_cert_callback,
+            )
+
+    def _get_sni_context(self, site):
+        """Build an ``SSL.Context`` for a single SNI site."""
+        context = SSL.Context(SSL.SSLv23_METHOD)
+        private_key_password = site.private_key_password
+        if private_key_password is None:
+            private_key_password = self._prompt_for_tls_password
+        context.set_passwd_cb(self._password_callback, private_key_password)
+        context.use_privatekey_file(site.private_key)
+        if site.certificate_chain:
+            context.load_verify_locations(site.certificate_chain)
+        context.use_certificate_file(site.certificate)
+        if site.ciphers is not None:
+            ciphers = site.ciphers
+            if isinstance(ciphers, str):
+                ciphers = ciphers.encode('utf-8')
+            context.set_cipher_list(ciphers)
+        verify_mode = {
+            'none': SSL.VERIFY_NONE,
+            'optional': SSL.VERIFY_PEER,
+            'required': SSL.VERIFY_PEER | SSL.VERIFY_FAIL_IF_NO_PEER_CERT,
+        }[site.client_verify_mode]
+        if verify_mode != SSL.VERIFY_NONE:
+            context.set_verify(verify_mode, _verify_client_cert_callback)
+        return context
+
+    def _sni_servername_callback(self, conn):
+        """Switch the TLS context based on the client-sent SNI name."""
+        server_name = conn.get_servername()
+        if isinstance(server_name, bytes):
+            server_name = server_name.decode('utf-8')
+        try:
+            site_key = self.sni.resolve(server_name)
+        except SNIRejected:
+            # pyOpenSSL offers no way to send a specific alert from
+            # this callback; raising aborts the handshake instead
+            raise
+        if site_key is not None:
+            conn.set_context(self._sni_contexts[site_key])
 
     def wrap(self, sock):
         """Wrap and return the given socket, plus WSGI environ entries."""
@@ -347,7 +446,45 @@ class pyOpenSSLAdapter(Adapter):
         conn = SSLConnection(self.context, sock)
 
         conn.set_accept_state()  # Tell OpenSSL this is a server connection
+        if self._sni_enforce_client_cert:
+            self._handshake_and_enforce(conn)
         return conn, self._environ.copy()
+
+    def _handshake_and_enforce(self, conn):
+        """Complete the handshake and enforce the site's client cert policy.
+
+        pyOpenSSL normally handshakes lazily on first I/O, but a
+        per-site ``client_verify_mode`` of ``'required'`` can only be
+        enforced once the handshake has completed, so it is driven
+        to completion here.
+        """
+        start = time.time()
+        while True:
+            try:
+                conn.do_handshake()
+                break
+            except (SSL.WantReadError, SSL.WantWriteError):
+                if time.time() - start > SSLFileobjectMixin.ssl_timeout:
+                    raise errors.FatalSSLAlert(
+                        'The TLS handshake timed out.',
+                    ) from None
+                time.sleep(SSLFileobjectMixin.ssl_retry)
+            except SSL.Error as tls_error:
+                raise errors.FatalSSLAlert(*tls_error.args) from tls_error
+
+        server_name = conn.get_servername()
+        if isinstance(server_name, bytes):
+            server_name = server_name.decode('utf-8')
+        try:
+            site = self.sni.site_for(server_name)
+        except SNIRejected:
+            site = None
+        if site is None or site.client_verify_mode != 'required':
+            return
+        if conn.get_peer_certificate() is None:
+            raise errors.FatalSSLAlert(
+                'The SNI site requires a client TLS certificate.',
+            )
 
     def _password_callback(
         self,

@@ -1,6 +1,7 @@
 """Tests for TLS support."""
 
 import contextlib
+import concurrent.futures
 import errno
 import functools
 import http.client
@@ -28,7 +29,14 @@ from cryptography.hazmat.primitives.serialization import (
 )
 
 from cheroot.connections import ConnectionManager
-from cheroot.ssl import Adapter, _ensure_peer_speaks_https
+from cheroot.ssl import (
+    Adapter,
+    SNIMap,
+    SNISite,
+    SNIRejected,
+    _ensure_peer_speaks_https,
+    _normalize_hostname,
+)
 
 from .._compat import (
     IS_ABOVE_OPENSSL10,
@@ -1158,3 +1166,434 @@ def test_prepare_socket_emits_deprecation_warning(
     assert sock.fileno() > 0
 
     sock.close()
+
+
+@pytest.mark.parametrize(
+    ('given', 'expected'),
+    (
+        ('example.com', 'example.com'),
+        ('EXAMPLE.COM', 'example.com'),
+        ('  Example.Com.  ', 'example.com'),
+        ('*.Example.COM.', '*.example.com'),
+        ('münchen.example', 'xn--mnchen-3ya.example'),
+        ('XN--MNCHEN-3YA.EXAMPLE', 'xn--mnchen-3ya.example'),
+    ),
+    ids=(
+        'plain',
+        'uppercase',
+        'whitespace-and-trailing-dot',
+        'wildcard-case-and-trailing-dot',
+        'idna-u-label',
+        'idna-a-label-case',
+    ),
+)
+def test_sni_hostname_normalization(given, expected):
+    """Check SNI host names are normalized for matching."""
+    assert _normalize_hostname(given) == expected
+
+
+@pytest.mark.parametrize(
+    'given',
+    (
+        '',
+        '   ',
+        '*',
+        '*.',
+        'foo.*.example.com',
+        'foo.*',
+        '*.example.*',
+    ),
+    ids=(
+        'empty',
+        'blank',
+        'bare-wildcard',
+        'empty-wildcard-suffix',
+        'inner-wildcard',
+        'wildcard-tld',
+        'wildcard-in-suffix',
+    ),
+)
+def test_sni_hostname_normalization_rejects_invalid(given):
+    """Check invalid SNI host names are rejected eagerly."""
+    with pytest.raises(ValueError, match='.'):
+        _normalize_hostname(given)
+
+
+def test_sni_hostname_normalization_rejects_non_string():
+    """Check non-string SNI host names are rejected eagerly."""
+    with pytest.raises(TypeError, match='string'):
+        _normalize_hostname(b'example.com')
+
+
+def _make_sni_site():
+    """Build a dummy SNI site (files are not checked at this level)."""
+    return SNISite(certificate='cert.pem', private_key='key.pem')
+
+
+@pytest.mark.parametrize(
+    'hostnames',
+    (
+        ('example.com', 'EXAMPLE.COM'),
+        ('example.com', 'example.com.'),
+        ('münchen.example', 'xn--mnchen-3ya.example'),
+        ('*.example.com', '*.EXAMPLE.COM.'),
+    ),
+    ids=(
+        'case-variant',
+        'trailing-dot-variant',
+        'idna-equivalent',
+        'wildcard-case-variant',
+    ),
+)
+def test_sni_map_rejects_duplicate_sites(hostnames):
+    """Check duplicate sites are detected after normalization."""
+    with pytest.raises(ValueError, match='Duplicate SNI site'):
+        SNIMap(dict.fromkeys(hostnames, _make_sni_site()))
+
+
+@pytest.mark.parametrize(
+    'policy',
+    ('fallback', 'allow', '', None, 42),
+    ids=('unknown-word', 'allow', 'empty', 'none', 'int'),
+)
+def test_sni_map_rejects_invalid_policies(policy):
+    """Check unknown missing/unknown-SNI policies are rejected."""
+    with pytest.raises((TypeError, ValueError), match='.'):
+        SNIMap({}, missing_sni=policy, unknown_sni=policy)
+
+
+@pytest.mark.parametrize(
+    'client_verify_mode',
+    ('verify', '', None, 2),
+    ids=('unknown-word', 'empty', 'none', 'int'),
+)
+def test_sni_site_rejects_invalid_client_verify_mode(client_verify_mode):
+    """Check unknown client certificate verify modes are rejected."""
+    with pytest.raises((TypeError, ValueError), match='client_verify_mode'):
+        SNISite(
+            certificate='cert.pem',
+            private_key='key.pem',
+            client_verify_mode=client_verify_mode,
+        )
+
+
+@pytest.mark.parametrize(
+    ('server_name', 'expected_key'),
+    (
+        ('www.example.com', 'www.example.com'),
+        ('WWW.EXAMPLE.COM.', 'www.example.com'),
+        ('api.example.com', '*.example.com'),
+        ('example.com', None),
+        ('a.b.example.com', None),
+        ('other.test', None),
+        (None, None),
+    ),
+    ids=(
+        'exact',
+        'exact-case-and-trailing-dot',
+        'wildcard-single-label',
+        'wildcard-does-not-match-apex',
+        'wildcard-does-not-match-two-labels',
+        'unknown',
+        'missing',
+    ),
+)
+def test_sni_map_resolution(server_name, expected_key):
+    """Check exact names win and wildcards match a single label."""
+    sni_map = SNIMap(
+        {
+            'www.example.com': _make_sni_site(),
+            '*.example.com': _make_sni_site(),
+        },
+    )
+    assert sni_map.resolve(server_name) == expected_key
+
+
+@pytest.mark.parametrize(
+    ('missing_sni', 'unknown_sni', 'server_name'),
+    (
+        ('reject', 'default', None),
+        ('default', 'reject', 'unknown.example'),
+        ('reject', 'reject', ''),
+    ),
+    ids=(
+        'missing-rejected',
+        'unknown-rejected',
+        'empty-rejected',
+    ),
+)
+def test_sni_map_reject_policies(missing_sni, unknown_sni, server_name):
+    """Check missing and unknown SNI names can be rejected."""
+    sni_map = SNIMap(
+        {'www.example.com': _make_sni_site()},
+        missing_sni=missing_sni,
+        unknown_sni=unknown_sni,
+    )
+    with pytest.raises(SNIRejected, match='.'):
+        sni_map.resolve(server_name)
+
+
+def test_adapter_converts_sni_dict_to_map(monkeypatch, dummy_adapter):
+    """Check the base adapter normalizes the ``sni`` argument."""
+    assert dummy_adapter.sni is None
+
+    monkeypatch.setattr(Adapter, '__abstractmethods__', set())
+    # pylint: disable=abstract-class-instantiated
+    adapter = Adapter(
+        certificate='cert.pem',
+        private_key='key.pem',
+        sni={'Example.COM.': _make_sni_site()},
+    )
+    assert isinstance(adapter.sni, SNIMap)
+    assert adapter.sni.resolve('example.com') == 'example.com'
+
+
+def _write_tls_material(directory, name, leaf_cert):
+    """Write a trustme leaf certificate chain and key to files."""
+    chain_path = directory / f'{name}-chain.pem'
+    key_path = directory / f'{name}-key.pem'
+    chain_path.write_bytes(
+        b''.join(pem.bytes() for pem in leaf_cert.cert_chain_pems),
+    )
+    key_path.write_bytes(leaf_cert.private_key_pem.bytes())
+    return str(chain_path), str(key_path)
+
+
+def _sni_tls_request(
+    conn_data,
+    server_hostname,
+    ca_pem_path,
+    client_cert_pem_path=None,
+    check_hostname=True,
+):
+    """Perform a TLS handshake plus a GET against a cheroot server.
+
+    Returns ``(peer_cert_dict, response_bytes)``.
+    """
+    interface, _host, port = conn_data
+    client_context = ssl.create_default_context(cafile=ca_pem_path)
+    if server_hostname is None or not check_hostname:
+        client_context.check_hostname = False
+    if client_cert_pem_path is not None:
+        client_context.load_cert_chain(client_cert_pem_path)
+    with socket.create_connection((interface, port), timeout=10) as raw_sock:
+        with client_context.wrap_socket(
+            raw_sock,
+            server_hostname=server_hostname,
+        ) as tls_sock:
+            peer_cert = tls_sock.getpeercert()
+            tls_sock.sendall(b'GET / HTTP/1.0\r\nHost: sni\r\n\r\n')
+            response = b''
+            while True:
+                chunk = tls_sock.recv(4096)
+                if not chunk:
+                    break
+                response += chunk
+    return peer_cert, response
+
+
+def _sni_cert_names(peer_cert):
+    """Extract the DNS SANs of a peer certificate dict."""
+    return tuple(
+        value
+        for kind, value in peer_cert.get('subjectAltName', ())
+        if kind == 'DNS'
+    )
+
+
+@pytest.mark.parametrize(
+    'adapter_type',
+    ('builtin', 'pyopenssl'),
+)
+# pylint: disable-next=too-many-positional-arguments
+def test_sni_virtual_hosting(  # noqa: C901
+    tls_http_server,
+    adapter_type,
+    ca,
+    tls_ca_certificate_pem_path,
+    tmp_path,
+):
+    """Verify SNI-based context selection and client cert isolation.
+
+    One site requires a client TLS certificate while the default
+    site does not; concurrent handshakes must not affect each other.
+    """
+    site_a_cert = ca.issue_cert('site-a.example')
+    site_b_cert = ca.issue_cert('site-b.example')
+    wild_cert = ca.issue_cert('*.wild.example')
+    client_cert = ca.issue_cert('sni-client')
+
+    a_chain, a_key = _write_tls_material(tmp_path, 'site-a', site_a_cert)
+    b_chain, b_key = _write_tls_material(tmp_path, 'site-b', site_b_cert)
+    wild_chain, wild_key = _write_tls_material(tmp_path, 'wild', wild_cert)
+    client_pem, _client_key = _write_tls_material(
+        tmp_path,
+        'client',
+        client_cert,
+    )
+    # the client needs a combined cert+key file for ``load_cert_chain``
+    with open(client_pem, 'ab') as client_file:
+        client_file.write(client_cert.private_key_pem.bytes())
+
+    tls_adapter_cls = get_ssl_adapter_class(name=adapter_type)
+    tls_adapter = tls_adapter_cls(
+        certificate=a_chain,
+        private_key=a_key,
+        certificate_chain=tls_ca_certificate_pem_path,
+        sni={
+            # intentionally non-normalized, to exercise normalization
+            'Site-B.Example.': SNISite(
+                certificate=b_chain,
+                private_key=b_key,
+                certificate_chain=tls_ca_certificate_pem_path,
+                client_verify_mode='required',
+            ),
+            '*.wild.example': SNISite(
+                certificate=wild_chain,
+                private_key=wild_key,
+                certificate_chain=tls_ca_certificate_pem_path,
+            ),
+        },
+    )
+
+    tlshttpserver = tls_http_server(
+        (ANY_INTERFACE_IPV4, EPHEMERAL_PORT),
+        tls_adapter,
+    )
+    conn_data = _get_conn_data(tlshttpserver.bind_addr)
+
+    def fetch_ok(server_hostname, expected_san, **kwargs):
+        peer_cert, response = _sni_tls_request(
+            conn_data,
+            server_hostname,
+            tls_ca_certificate_pem_path,
+            **kwargs,
+        )
+        assert expected_san in _sni_cert_names(peer_cert)
+        assert b'Hello world!' in response
+
+    def fetch_rejected(**kwargs):
+        try:
+            _peer_cert, response = _sni_tls_request(
+                conn_data,
+                tls_ca_certificate_pem_path=tls_ca_certificate_pem_path,
+                **kwargs,
+            )
+        except (ssl.SSLError, ConnectionError, OSError):
+            return
+        # the request must not be served
+        assert b'Hello world!' not in response
+
+    scenarios = (
+        # the default site must not be affected by site B's
+        # client certificate requirement
+        functools.partial(fetch_ok, 'site-a.example', 'site-a.example'),
+        functools.partial(fetch_ok, None, 'site-a.example'),
+        functools.partial(
+            fetch_ok,
+            'unknown.example',
+            'site-a.example',
+            check_hostname=False,
+        ),
+        # site B requires a client certificate
+        functools.partial(
+            fetch_ok,
+            'site-b.example',
+            'site-b.example',
+            client_cert_pem_path=client_pem,
+        ),
+        functools.partial(
+            fetch_ok,
+            'SITE-B.EXAMPLE',
+            'site-b.example',
+            client_cert_pem_path=client_pem,
+        ),
+        functools.partial(fetch_rejected, server_hostname='site-b.example'),
+        # explicit wildcard rules: exactly one label
+        functools.partial(fetch_ok, 'foo.wild.example', '*.wild.example'),
+        functools.partial(
+            fetch_ok,
+            'a.b.wild.example',
+            'site-a.example',
+            check_hostname=False,
+        ),
+    )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        futures = [
+            pool.submit(scenario)
+            for _round in range(4)
+            for scenario in scenarios
+        ]
+        for future in futures:
+            future.result()
+
+
+@pytest.mark.parametrize(
+    'adapter_type',
+    ('builtin', 'pyopenssl'),
+)
+@pytest.mark.parametrize(
+    ('missing_sni', 'unknown_sni', 'server_hostname'),
+    (
+        ('reject', 'default', None),
+        ('default', 'reject', 'unknown.example'),
+    ),
+    ids=('missing-sni-rejected', 'unknown-sni-rejected'),
+)
+# pylint: disable-next=too-many-positional-arguments
+def test_sni_reject_policies(
+    tls_http_server,
+    adapter_type,
+    ca,
+    tls_ca_certificate_pem_path,
+    tmp_path,
+    missing_sni,
+    unknown_sni,
+    server_hostname,
+):
+    """Verify missing/unknown SNI names abort the handshake on demand."""
+    site_a_cert = ca.issue_cert('site-a.example')
+    site_b_cert = ca.issue_cert('site-b.example')
+    a_chain, a_key = _write_tls_material(tmp_path, 'site-a', site_a_cert)
+    b_chain, b_key = _write_tls_material(tmp_path, 'site-b', site_b_cert)
+
+    tls_adapter_cls = get_ssl_adapter_class(name=adapter_type)
+    tls_adapter = tls_adapter_cls(
+        certificate=a_chain,
+        private_key=a_key,
+        certificate_chain=tls_ca_certificate_pem_path,
+        sni=SNIMap(
+            {
+                'site-b.example': SNISite(
+                    certificate=b_chain,
+                    private_key=b_key,
+                    certificate_chain=tls_ca_certificate_pem_path,
+                ),
+            },
+            missing_sni=missing_sni,
+            unknown_sni=unknown_sni,
+        ),
+    )
+
+    tlshttpserver = tls_http_server(
+        (ANY_INTERFACE_IPV4, EPHEMERAL_PORT),
+        tls_adapter,
+    )
+    conn_data = _get_conn_data(tlshttpserver.bind_addr)
+
+    with pytest.raises((ssl.SSLError, ConnectionError, OSError)):
+        _sni_tls_request(
+            conn_data,
+            server_hostname,
+            tls_ca_certificate_pem_path,
+        )
+
+    # a configured name is still served
+    peer_cert, response = _sni_tls_request(
+        conn_data,
+        'site-b.example',
+        tls_ca_certificate_pem_path,
+    )
+    assert 'site-b.example' in _sni_cert_names(peer_cert)
+    assert b'Hello world!' in response

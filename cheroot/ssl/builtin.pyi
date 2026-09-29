@@ -1,7 +1,7 @@
 import collections.abc as _c
 import typing as _t
 
-from . import Adapter
+from . import Adapter, SNIMap, SNISite
 
 DEFAULT_BUFFER_SIZE: int
 
@@ -19,6 +19,7 @@ class BuiltinSSLAdapter(Adapter):
         | bytes
         | str
         | None = ...,
+        sni: SNIMap | _c.Mapping[str, SNISite] | None = ...,
     ) -> None: ...
     @property
     def context(self): ...

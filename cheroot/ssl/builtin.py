@@ -29,7 +29,7 @@ except ImportError:
 from .. import errors
 from ..makefile import StreamReader, StreamWriter
 from ..server import HTTPServer
-from . import Adapter
+from . import Adapter, SNIRejected
 
 
 def _assert_ssl_exc_contains(exc, *msgs):
@@ -159,6 +159,17 @@ def _sni_callback(sock, sni, context):
     # return None to allow the TLS negotiation to continue
 
 
+_CLIENT_VERIFY_MODE_TO_SSL = (
+    {
+        'none': ssl.CERT_NONE,
+        'optional': ssl.CERT_OPTIONAL,
+        'required': ssl.CERT_REQUIRED,
+    }
+    if ssl is not None
+    else {}
+)
+
+
 class BuiltinSSLAdapter(Adapter):
     """Wrapper for integrating Python's builtin :py:mod:`ssl` with Cheroot."""
 
@@ -176,6 +187,10 @@ class BuiltinSSLAdapter(Adapter):
 
     private_key_password = None
     """Optional passphrase for password protected private key."""
+
+    sni = None
+    """Optional :py:class:`~cheroot.ssl.SNIMap` with per-site TLS
+    configurations selected via SNI during the handshake."""
 
     # from mod_ssl/pkg.sslmod/ssl_engine_vars.c ssl_var_lookup_ssl_cert
     CERT_KEY_TO_ENV = {
@@ -234,6 +249,7 @@ class BuiltinSSLAdapter(Adapter):
         ciphers=None,
         *,
         private_key_password=None,
+        sni=None,
     ):
         """Set up context in addition to base class properties if available."""
         if ssl is None:
@@ -245,7 +261,10 @@ class BuiltinSSLAdapter(Adapter):
             certificate_chain,
             ciphers,
             private_key_password=private_key_password,
+            sni=sni,
         )
+
+        self._sni_contexts = {}
 
         if private_key_password is None:
             private_key_password = self._prompt_for_tls_password
@@ -261,6 +280,11 @@ class BuiltinSSLAdapter(Adapter):
         )
         if self.ciphers is not None:
             self.context.set_ciphers(ciphers)
+
+        if self.sni is not None:
+            for hostname, site in self.sni.items():
+                self._sni_contexts[hostname] = self._make_sni_context(site)
+            self._upgrade_verify_mode_for_sni()
 
         self._server_env = self._make_env_cert_dict(
             'SSL_SERVER',
@@ -287,6 +311,76 @@ class BuiltinSSLAdapter(Adapter):
         cert_end += len(ssl.PEM_FOOTER)
         self._server_env['SSL_SERVER_CERT'] = cert[cert_start:cert_end]
 
+    def _make_sni_context(self, site):
+        """Build an ``SSLContext`` for a single SNI site."""
+        private_key_password = site.private_key_password
+        if private_key_password is None:
+            private_key_password = self._prompt_for_tls_password
+        context = ssl.create_default_context(
+            purpose=ssl.Purpose.CLIENT_AUTH,
+            cafile=site.certificate_chain,
+        )
+        context.load_cert_chain(
+            site.certificate,
+            site.private_key,
+            password=private_key_password,
+        )
+        if site.ciphers is not None:
+            context.set_ciphers(site.ciphers)
+        context.verify_mode = _CLIENT_VERIFY_MODE_TO_SSL[
+            site.client_verify_mode
+        ]
+        return context
+
+    def _upgrade_verify_mode_for_sni(self):
+        """Make the default context request client certificates.
+
+        OpenSSL keeps the verify flags of the initial context when
+        the context is switched via SNI, so the default context must
+        ask for client certificates if any site wants them. Per-site
+        ``'required'`` policies are enforced after the handshake in
+        :meth:`wrap`.
+        """
+        wants_client_certs = any(
+            site.client_verify_mode != 'none'
+            for _hostname, site in self.sni.items()
+        )
+        if (
+            wants_client_certs
+            and self.context.verify_mode == ssl.CERT_NONE
+        ):
+            self.context.verify_mode = ssl.CERT_OPTIONAL
+
+    def _enforce_sni_client_cert(self, sock):
+        """Enforce the selected site's client certificate policy."""
+        try:
+            site = self.sni.site_for(getattr(sock, 'sni', None))
+        except SNIRejected:
+            site = None
+        if site is None or site.client_verify_mode != 'required':
+            return
+        peer_cert = None
+        with suppress(ValueError):
+            peer_cert = sock.getpeercert()
+        if peer_cert:
+            return
+        raise errors.FatalSSLAlert(
+            'The SNI site requires a client TLS certificate.',
+        )
+
+    def _sni_context_callback(self, sock, server_name, context):
+        """Select the TLS context matching the client-sent SNI name."""
+        sock.sni = server_name
+        try:
+            site_key = self.sni.resolve(server_name)
+        except SNIRejected:
+            return ssl.ALERT_DESCRIPTION_UNRECOGNIZED_NAME
+        if site_key is None:
+            # continue the handshake with the default context
+            return None
+        sock.context = self._sni_contexts[site_key]
+        return None
+
     @property
     def context(self):
         """:py:class:`~ssl.SSLContext` that will be used to wrap sockets."""
@@ -304,7 +398,11 @@ class BuiltinSSLAdapter(Adapter):
         # TODO: chain callbacks
         with suppress(AttributeError):
             if ssl.HAS_SNI and context.sni_callback is None:
-                context.sni_callback = _sni_callback
+                context.sni_callback = (
+                    self._sni_context_callback
+                    if self.sni is not None
+                    else _sni_callback
+                )
 
     def wrap(self, sock):
         """Wrap and return the given socket, plus WSGI environ entries."""
@@ -342,6 +440,9 @@ class BuiltinSSLAdapter(Adapter):
             raise errors.FatalSSLAlert(
                 *tcp_connection_drop_error.args,
             ) from tcp_connection_drop_error
+
+        if self.sni is not None:
+            self._enforce_sni_client_cert(s)
 
         return s, self.get_environ(s)
 
@@ -385,7 +486,9 @@ class BuiltinSSLAdapter(Adapter):
         with suppress(AttributeError):
             ssl_environ['SSL_TLS_SNI'] = sock.sni
 
-        if self.context and self.context.verify_mode != ssl.CERT_NONE:
+        # `sock.context` reflects a context switched via SNI, if any
+        sock_context = getattr(sock, 'context', None) or self.context
+        if sock_context and sock_context.verify_mode != ssl.CERT_NONE:
             client_cert = sock.getpeercert()
             if client_cert:
                 # builtin ssl **ALWAYS** validates client certificates

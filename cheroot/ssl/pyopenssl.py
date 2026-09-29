@@ -45,6 +45,14 @@ Both are :py:data:`None` by default. If :py:attr:`ssl_adapter.context
 but ``.private_key`` and ``.certificate`` are both given and valid, they
 will be read, and the context will be automatically created from them.
 
+.. note::
+
+   SNI-based virtual hosting via
+   :py:meth:`ssl.Adapter.add_sni_site <cheroot.ssl.Adapter.add_sni_site>`
+   is not supported by this adapter and raises
+   :py:exc:`NotImplementedError`. Use
+   :py:class:`~cheroot.ssl.builtin.BuiltinSSLAdapter` for SNI sites.
+
 .. spelling::
 
    pyopenssl

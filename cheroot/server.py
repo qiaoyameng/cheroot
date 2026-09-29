@@ -194,6 +194,34 @@ comma_separated_headers = [
 ]
 
 
+forbidden_trailer_headers = frozenset({
+    # Message framing (RFC 9110, Section 6.5.1)
+    b'Content-Length',
+    b'TE',
+    b'Trailer',
+    b'Transfer-Encoding',
+    # Connection management
+    b'Connection',
+    b'Keep-Alive',
+    b'Upgrade',
+    # Routing
+    b'Host',
+    # Authentication
+    b'Authorization',
+    b'Cookie',
+    b'Proxy-Authenticate',
+    b'Proxy-Authorization',
+    b'WWW-Authenticate',
+})
+"""Fields that must never be honored when received in a trailer section.
+
+Per RFC 9110, Section 6.5.1, a trailer section must not contain fields
+needed for message framing, connection management, routing, or
+authentication. Cheroot silently discards such fields so they can never
+override the regular message headers.
+"""
+
+
 if not hasattr(logging, 'statistics'):
     logging.statistics = {}
 
@@ -484,6 +512,7 @@ class ChunkedRFile:
         self.buffer = EMPTY
         self.bufsize = bufsize
         self.closed = False
+        self.trailers = None
 
     def _fetch(self):
         if self.closed:
@@ -510,6 +539,7 @@ class ChunkedRFile:
 
         if chunk_size <= 0:
             self.closed = True
+            self._parse_trailers()
             return
 
         # if line: chunk_extension = line[0]
@@ -652,6 +682,42 @@ class ChunkedRFile:
 
             yield line
 
+    def _parse_trailers(self):
+        """Parse the trailer section following the terminating chunk.
+
+        The trailer fields are parsed with the same rules as regular
+        message headers (repeated fields are folded together with a
+        comma where their specification so dictates). Fields that are
+        forbidden in trailers (message framing, connection management,
+        routing, and authentication fields) are silently discarded so
+        they can never modify the regular message headers.
+        """
+        trailer_block = EMPTY.join(self.read_trailer_lines())
+        trailers = HeaderReader()(io.BytesIO(trailer_block + CRLF))
+        for forbidden in forbidden_trailer_headers:
+            trailers.pop(forbidden, None)
+        self.trailers = trailers
+
+    def get_trailers(self):
+        """Return the trailer fields received after the request body.
+
+        The trailers only become available once the request body has
+        been fully consumed and its terminating chunk (and the trailer
+        section following it) has been read and validated. The returned
+        dict is a copy; mutating it does not affect any server state.
+
+        :returns: trailer fields, keyed by title-cased field name
+        :rtype: dict[bytes, bytes]
+
+        :raises ValueError: if the request body has not been fully
+            consumed yet
+        """
+        if self.trailers is None:
+            raise ValueError(
+                'Cannot read trailers until the request body has been read.',
+            )
+        return dict(self.trailers)
+
     def close(self):
         """Release resources allocated for ``rfile``."""
         self.rfile.close()
@@ -718,6 +784,7 @@ class HTTPRequest:
         # Use the lowest-common protocol in case read_request_line errors.
         self.response_protocol = 'HTTP/1.0'
         self.inheaders = {}
+        self.trailer_declared = set()
 
         self.status = ''
         self.outheaders = []
@@ -1054,6 +1121,16 @@ class HTTPRequest:
                     self.close_connection = True
                     return False
 
+        # Record the trailer fields the client announced via the Trailer
+        # request header, so any mismatch with the trailer fields that
+        # actually arrive can be reported once the body has been read.
+        trailer_header = self.inheaders.get(b'Trailer', EMPTY)
+        self.trailer_declared = {
+            name.strip().title()
+            for name in trailer_header.split(b',')
+            if name.strip()
+        } - forbidden_trailer_headers
+
         # From PEP 333:
         # "Servers and gateways that implement HTTP 1.1 must provide
         # transparent support for HTTP 1.1's "expect/continue" mechanism.
@@ -1108,11 +1185,100 @@ class HTTPRequest:
                 return
             self.rfile = KnownLengthRFile(self.conn.rfile, cl)
 
-        self.server.gateway(self).respond()
+        try:
+            self.server.gateway(self).respond()
+        except errors.MaxSizeExceeded:
+            if self.sent_headers:
+                raise
+            self.simple_response(
+                '413 Request Entity Too Large',
+                'The entity sent with the request exceeds the maximum '
+                'allowed bytes.',
+            )
+            return
         self.ready and self.ensure_headers_sent()
+
+        if self.chunked_read:
+            self._report_trailer_mismatch()
 
         if self.chunked_write:
             self.conn.wfile.write(b'0\r\n\r\n')
+
+    def get_trailers(self):
+        """Return the trailer fields received after the request body.
+
+        The trailers only become available once the request body has
+        been fully consumed and its terminating chunk (and the trailer
+        section following it) has been read and validated. The returned
+        dict is a copy; mutating it does not affect any server state.
+
+        :returns: trailer fields, keyed by title-cased field name
+        :rtype: dict[bytes, bytes]
+
+        :raises ValueError: if the request is not chunked or its body
+            has not been fully consumed yet
+        """
+        if not self.chunked_read:
+            raise ValueError(
+                'Trailers are only sent with chunked request bodies.',
+            )
+        rfile = self.rfile
+        if not isinstance(rfile, ChunkedRFile):
+            raise ValueError(
+                'Cannot read trailers until the request body has been read.',
+            )
+        return rfile.get_trailers()
+
+    def get_trailer_mismatch(self):
+        """Compare the Trailer header declaration with what arrived.
+
+        :returns: a dict with a ``missing`` list of field names that
+            were declared in the ``Trailer`` request header but never
+            arrived, and an ``undeclared`` list of field names that
+            arrived without having been declared
+        :rtype: dict[str, list[bytes]]
+
+        :raises ValueError: if the request is not chunked or its body
+            has not been fully consumed yet
+        """
+        received = set(self.get_trailers())
+        return {
+            'missing': sorted(self.trailer_declared - received),
+            'undeclared': sorted(received - self.trailer_declared),
+        }
+
+    def _report_trailer_mismatch(self):
+        """Log any mismatch between declared and received trailers."""
+        rfile = self.rfile
+        if not isinstance(rfile, ChunkedRFile) or rfile.trailers is None:
+            # The body (and its trailer section) was not fully consumed,
+            # so there is nothing trustworthy to compare against.
+            return
+        mismatch = self.get_trailer_mismatch()
+        if mismatch['missing'] or mismatch['undeclared']:
+            self.server.error_log(
+                'Trailer declaration mismatch: declared but not received: '
+                '%r; received but not declared: %r' % (
+                    mismatch['missing'],
+                    mismatch['undeclared'],
+                ),
+                level=logging.WARNING,
+            )
+
+    def _consume_remaining_body(self):
+        """Read and discard the unread portion of a chunked request body.
+
+        This runs when the application finished responding without
+        consuming the entire request body, so that the connection can be
+        reused for the next request. Any failure while consuming the
+        remainder (including the terminating chunk and the trailer
+        section) renders the connection unusable for keep-alive.
+        """
+        try:
+            while self.rfile.read(8192):
+                pass
+        except (ValueError, OSError, errors.MaxSizeExceeded):
+            self.close_connection = True
 
     def simple_response(self, status, msg=''):
         """Write a simple response back to the client."""
@@ -1203,6 +1369,30 @@ class HTTPRequest:
             can_keep = self.server.can_add_keepalive_connection
             self.close_connection = not can_keep
 
+        if not self.close_connection:
+            # Read any remaining request body data on the socket.
+            # "If an origin server receives a request that does not include an
+            # Expect request-header field with the "100-continue" expectation,
+            # the request includes a request body, and the server responds
+            # with a final status code before reading the entire request body
+            # from the transport connection, then the server SHOULD NOT close
+            # the transport connection until it has read the entire request,
+            # or until the client closes the connection. Otherwise, the client
+            # might not reliably receive the response message. However, this
+            # requirement is not be construed as preventing a server from
+            # defending itself against denial-of-service attacks, or from
+            # badly broken client implementations."
+            if self.chunked_read:
+                # Consume the rest of the body, the terminating chunk,
+                # and the trailer section. If any of it fails to parse,
+                # the message boundary is lost and the connection must
+                # not be reused.
+                self._consume_remaining_body()
+            else:
+                remaining = getattr(self.rfile, 'remaining', 0)
+                if remaining > 0:
+                    self.rfile.read(remaining)
+
         if b'connection' not in hkeys:
             if self.response_protocol == 'HTTP/1.1':
                 # Both server and client are HTTP/1.1 or better
@@ -1219,23 +1409,6 @@ class HTTPRequest:
                     f'timeout={self.server.timeout}'.encode('ISO-8859-1'),
                 ),
             )
-
-        if (not self.close_connection) and (not self.chunked_read):
-            # Read any remaining request body data on the socket.
-            # "If an origin server receives a request that does not include an
-            # Expect request-header field with the "100-continue" expectation,
-            # the request includes a request body, and the server responds
-            # with a final status code before reading the entire request body
-            # from the transport connection, then the server SHOULD NOT close
-            # the transport connection until it has read the entire request,
-            # or until the client closes the connection. Otherwise, the client
-            # might not reliably receive the response message. However, this
-            # requirement is not be construed as preventing a server from
-            # defending itself against denial-of-service attacks, or from
-            # badly broken client implementations."
-            remaining = getattr(self.rfile, 'remaining', 0)
-            if remaining > 0:
-                self.rfile.read(remaining)
 
         if b'date' not in hkeys:
             self.outheaders.append(

@@ -13,8 +13,6 @@ from re import match as _matches_pattern
 
 import pytest
 
-from jaraco.text import trim, unwrap
-
 import cheroot.server
 from cheroot._compat import IS_CI, IS_MACOS, IS_PYPY, IS_WINDOWS
 from cheroot.test import helper, webtest
@@ -1356,15 +1354,6 @@ def test_No_Message_Body(test_client):
     http_connection.close()
 
 
-@pytest.mark.xfail(
-    reason=unwrap(
-        trim("""
-        Headers from earlier request leak into the request
-        line for a subsequent request, resulting in 400
-        instead of 413. See cherrypy/cheroot#69 for details.
-        """),
-    ),
-)
 def test_Chunked_Encoding(test_client):
     """Test HTTP uploads with chunked transfer-encoding."""
     # Initialize a persistent HTTP connection

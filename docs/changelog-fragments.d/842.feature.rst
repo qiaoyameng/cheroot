@@ -1,0 +1,11 @@
+Added a read-only trailer extension for chunked request bodies: once the
+request body has been fully consumed and its terminating chunk validated,
+WSGI applications can retrieve the trailer fields through the new
+``cheroot.trailers`` environ callable, and inspect any mismatch against the
+``Trailer`` request header declaration through ``cheroot.trailer_mismatch``.
+Trailer fields related to message framing, connection management, routing,
+and authentication are silently discarded, and repeated fields are combined
+with the same rules as regular message headers. When an application responds
+without consuming the whole body, the server now drains the remainder
+(including the trailer section) so the connection can be reused; connections
+with malformed trailer sections are no longer reused.

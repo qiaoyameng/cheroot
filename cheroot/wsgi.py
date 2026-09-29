@@ -317,6 +317,19 @@ class Gateway_10(Gateway):
         if cl is not None:
             env['CONTENT_LENGTH'] = cl
 
+        if req.chunked_read:
+            # Read-only trailer extension: zero-argument callables that
+            # only yield a result once the request body has been fully
+            # consumed and its terminating chunk validated. They raise
+            # ValueError when called earlier.
+            env['cheroot.trailers'] = lambda: {
+                bton(k): bton(v) for k, v in req.get_trailers().items()
+            }
+            env['cheroot.trailer_mismatch'] = lambda: {
+                kind: [bton(name) for name in names]
+                for kind, names in req.get_trailer_mismatch().items()
+            }
+
         if req.conn.ssl_env:
             env.update(req.conn.ssl_env)
 

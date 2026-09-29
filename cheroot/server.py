@@ -1882,7 +1882,10 @@ class HTTPServer:
         self._connections = connections.ConnectionManager(self)
 
         # Create worker threads
-        self.requests.start()
+        # (unless the pool is shared with another server and already
+        # running)
+        if not self.requests.started:
+            self.requests.start()
 
         self.ready = True
         self._start_time = time.time()

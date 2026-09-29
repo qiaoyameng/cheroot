@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import types
 import urllib.parse  # noqa: WPS301
 import uuid
@@ -581,6 +582,434 @@ def test_threadpool_multistart_validation(monkeypatch):
         match='Threadpools can only be started once.',
     ):
         tp.start()
+
+
+class _FakeQuotaConn:
+    """A minimal stand-in for a connection in quota bookkeeping tests."""
+
+    def __init__(self, endpoint):
+        """Initialize the fake connection arriving via ``endpoint``."""
+        self.server = types.SimpleNamespace(bind_addr=endpoint)
+        self.closed = False
+
+    def close(self):
+        """Record that the connection has been closed."""
+        self.closed = True
+
+
+def _respond_text(req, text):
+    """Send a plain text response through the request's gateway API."""
+    body = text.encode('ascii')
+    req.status = b'200 OK'
+    req.outheaders.extend(
+        (
+            (b'Content-Type', b'text/plain'),
+            (b'Content-Length', str(len(body)).encode('ascii')),
+        ),
+    )
+    req.ensure_headers_sent()
+    req.write(body)
+
+
+def test_threadpool_endpoint_quotas_park_connections_without_slots():
+    """Connections beyond the configured quotas wait without a slot."""
+    admin_endpoint = ('127.0.0.1', 10001)
+    data_endpoint = ('127.0.0.1', 10002)
+    pool = ThreadPool(
+        server=None,
+        min=1,
+        max=1,
+        endpoint_quotas={admin_endpoint: 1},
+        shared_quota=1,
+    )
+
+    admin_conn1 = _FakeQuotaConn(admin_endpoint)
+    admin_conn2 = _FakeQuotaConn(admin_endpoint)
+    admin_conn3 = _FakeQuotaConn(admin_endpoint)
+    data_conn1 = _FakeQuotaConn(data_endpoint)
+
+    pool.put(admin_conn1)  # takes the reserved admin slot
+    pool.put(admin_conn2)  # borrows the shared slot
+    pool.put(admin_conn3)  # parked: no slots left
+    pool.put(data_conn1)  # parked: the shared slot is taken
+
+    # only the two connections holding slots are queued for the workers;
+    # the parked connections do not count as executing
+    assert pool.qsize == 2
+    assert list(pool._quota_waiting) == [admin_conn3, data_conn1]
+
+    # releasing a slot dispatches waiting connections in arrival order
+    pool.release(admin_conn1)
+    assert list(pool._quota_waiting) == [data_conn1]
+    pool.release(admin_conn2)
+    assert not pool._quota_waiting
+
+    dispatched = [pool.get() for _ in range(4)]
+    assert dispatched == [admin_conn1, admin_conn2, admin_conn3, data_conn1]
+
+
+def test_threadpool_reserved_quota_cannot_be_borrowed():
+    """Other endpoints must not take a freed reserved slot."""
+    admin_endpoint = ('127.0.0.1', 10001)
+    data_endpoint = ('127.0.0.1', 10002)
+    pool = ThreadPool(
+        server=None,
+        min=1,
+        max=1,
+        endpoint_quotas={admin_endpoint: 1},
+        shared_quota=0,
+    )
+
+    admin_conn1 = _FakeQuotaConn(admin_endpoint)
+    data_conn1 = _FakeQuotaConn(data_endpoint)
+    admin_conn2 = _FakeQuotaConn(admin_endpoint)
+
+    pool.put(admin_conn1)
+    assert pool.get() is admin_conn1  # a worker picks it up
+    pool.put(data_conn1)  # parked: no shared slots, no reserved slots
+    pool.release(admin_conn1)
+
+    # the freed reserved slot stays reserved for the admin endpoint
+    assert pool.qsize == 0
+    assert list(pool._quota_waiting) == [data_conn1]
+
+    # while the admin endpoint can use its own reserved slot again
+    pool.put(admin_conn2)
+    assert pool.qsize == 1
+    assert pool.get() is admin_conn2
+
+
+def test_threadpool_quota_slots_are_returned_and_reusable():
+    """Released slots are returned and can be re-acquired (keep-alive)."""
+    endpoint = ('127.0.0.1', 10001)
+    pool = ThreadPool(
+        server=None,
+        min=1,
+        max=1,
+        endpoint_quotas={endpoint: 1},
+        shared_quota=1,
+    )
+
+    conn = _FakeQuotaConn(endpoint)
+    pool.put(conn)
+    assert pool.get() is conn
+    pool.release(conn)
+
+    # releasing a connection that holds no slot is a harmless no-op
+    pool.release(conn)
+    pool.release(_FakeQuotaConn(endpoint))
+    assert pool._shared_in_use == 0
+    assert not pool._reserved_in_use
+    assert not pool._quota_tokens
+
+    # a keep-alive connection re-joins the scheduling for its next
+    # request instead of holding on to a slot
+    pool.put(conn)
+    assert pool.get() is conn
+    pool.release(conn)
+    assert pool._shared_in_use == 0
+    assert not pool._reserved_in_use
+
+
+def test_threadpool_stop_closes_parked_connections():
+    """Stopping the pool drops connections that wait for a slot."""
+    pool = ThreadPool(
+        server=None,
+        min=1,
+        max=1,
+        endpoint_quotas={},
+        shared_quota=0,
+    )
+    conn = _FakeQuotaConn(('127.0.0.1', 10001))
+    pool.put(conn)  # parked: no slots configured at all
+    assert pool.qsize == 0
+
+    pool.stop()
+    assert conn.closed
+    assert not pool._quota_waiting
+
+
+def test_threadpool_workers_reserve_capacity_per_endpoint():
+    """Workers only execute connections that were granted a slot.
+
+    Drives a real pool of worker threads with controlled-blocking
+    connections: once the data endpoint has exhausted its reserved and
+    the shared execution slots, an admin connection must still enter
+    the handler. Keep-alive connections re-join the scheduling per
+    request, and closing, errors and shrinking return the slots.
+    """
+    data_endpoint = ('127.0.0.1', 10001)
+    admin_endpoint = ('127.0.0.1', 10002)
+    data_capacity = 3  # 2 reserved + 1 shared
+    unblock = threading.Event()
+    pool_holder = {}
+
+    class FakeServer:
+        """A minimal stand-in for the server side of a connection."""
+
+        def __init__(self, endpoint):
+            """Initialize the fake server bound to ``endpoint``."""
+            self.bind_addr = endpoint
+            self.stats = {'Enabled': False, 'Worker Threads': {}}
+            self.interrupt = None
+            self.requests = None
+
+        def error_log(self, *args, **kwargs):
+            """Swallow log messages."""
+
+        def put_conn(self, conn):
+            """Re-queue a keep-alive connection for its next request."""
+            pool_holder['pool'].put(conn)
+
+    class FakeConn:
+        """A controlled-blocking connection to a fake server."""
+
+        remote_addr = '127.0.0.1'
+        remote_port = 0
+
+        def __init__(self, server, keep_alive=False):
+            """Initialize the fake connection."""
+            self.server = server
+            self.keep_alive = keep_alive
+            self.closed = False
+            self.entered = threading.Event()
+            self.communicate_calls = 0
+
+        def communicate(self):
+            """Block until the test releases the fake request."""
+            self.communicate_calls += 1
+            self.entered.set()
+            unblock.wait(timeout=20)
+            return self.keep_alive and self.communicate_calls == 1
+
+        def close(self):
+            """Record that the connection has been closed."""
+            self.closed = True
+
+    class ExplodingConn(FakeConn):
+        """A connection whose processing fails."""
+
+        def communicate(self):
+            """Pretend the client disappeared mid-request."""
+            raise ConnectionError('client went away')
+
+    primary_server = FakeServer(data_endpoint)
+    pool = ThreadPool(
+        server=primary_server,
+        min=2,
+        max=4,
+        endpoint_quotas={data_endpoint: 2, admin_endpoint: 1},
+        shared_quota=1,
+    )
+    primary_server.requests = pool
+    pool_holder['pool'] = pool
+    pool.start()
+    pool.grow(2)  # 4 workers in total
+
+    data_server = FakeServer(data_endpoint)
+    admin_server = FakeServer(admin_endpoint)
+
+    # saturate the data endpoint's reserved and shared execution slots
+    data_conns = [FakeConn(data_server) for _ in range(data_capacity)]
+    for conn in data_conns:
+        pool.put(conn)
+    for conn in data_conns:
+        assert conn.entered.wait(timeout=10)
+
+    # one more data connection is parked and does not count as executing
+    parked_data_conn = FakeConn(data_server)
+    pool.put(parked_data_conn)
+    assert not parked_data_conn.entered.wait(timeout=0.5)
+
+    # the admin endpoint still has its reserved slot: the connection
+    # enters the handler while all data slots stay occupied
+    admin_conn = FakeConn(admin_server, keep_alive=True)
+    pool.put(admin_conn)
+    assert admin_conn.entered.wait(timeout=10)
+
+    # finish the blocked requests; slots are returned on completion
+    unblock.set()
+
+    # the keep-alive connection re-joins the scheduling for its next
+    # request instead of permanently holding its slot
+    for _ in range(100):
+        if admin_conn.communicate_calls >= 2:
+            break
+        time.sleep(0.1)
+    assert admin_conn.communicate_calls == 2
+    assert admin_conn.closed
+
+    # the parked data connection is dispatched once capacity frees up
+    assert parked_data_conn.entered.wait(timeout=10)
+    for _ in range(100):
+        if parked_data_conn.closed:
+            break
+        time.sleep(0.1)
+    assert parked_data_conn.closed
+
+    # a failing connection returns its slot as well
+    exploding_conn = ExplodingConn(admin_server)
+    pool.put(exploding_conn)
+    for _ in range(100):
+        if exploding_conn.closed:
+            break
+        time.sleep(0.1)
+    assert exploding_conn.closed
+
+    # shrinking the pool must not strand any execution slots either
+    pool.shrink(2)
+    for _ in range(100):
+        if sum(thread.is_alive() for thread in pool._threads) <= 2:
+            break
+        time.sleep(0.1)
+    assert sum(thread.is_alive() for thread in pool._threads) == 2
+
+    pool.stop()
+    assert all(conn.closed for conn in data_conns)
+    assert pool._shared_in_use == 0
+    assert not pool._reserved_in_use
+    assert not pool._quota_tokens
+    assert not pool._quota_waiting
+
+
+def test_shared_threadpool_keeps_admin_endpoint_responsive(request):
+    """Reserved capacity lets admin requests in when data saturates.
+
+    Two servers (a data endpoint and an admin endpoint) share one
+    thread pool. Once the data endpoint has exhausted its reserved and
+    the shared execution slots with blocked requests, admin requests
+    must still enter the request handler.
+    """
+    localhost = '127.0.0.1'
+    worker_count = 4
+    data_reserved = 2
+    admin_reserved = 1
+    shared_slots = 1
+    data_capacity = data_reserved + shared_slots
+
+    data_active = 0
+    data_active_lock = threading.Lock()
+    data_saturated = threading.Event()
+    unblock_data = threading.Event()
+    admin_handler_entered = threading.Event()
+
+    class DataGateway(Gateway):
+        """A controlled-blocking app occupying its execution slots."""
+
+        def respond(self):
+            """Block until the test releases the data requests."""
+            nonlocal data_active
+            with data_active_lock:
+                data_active += 1
+                if data_active == data_capacity:
+                    data_saturated.set()
+            try:
+                unblock_data.wait(timeout=20)
+                _respond_text(self.req, 'data')
+            finally:
+                with data_active_lock:
+                    data_active -= 1
+
+    class AdminGateway(Gateway):
+        """The admin app that must stay reachable."""
+
+        def respond(self):
+            """Record that the admin handler was entered."""
+            admin_handler_entered.set()
+            _respond_text(self.req, 'admin')
+
+    data_server = HTTPServer(
+        bind_addr=(localhost, EPHEMERAL_PORT),
+        gateway=DataGateway,
+    )
+    admin_server = HTTPServer(
+        bind_addr=(localhost, EPHEMERAL_PORT),
+        gateway=AdminGateway,
+    )
+    shared_pool = ThreadPool(
+        server=data_server,
+        min=worker_count,
+        max=worker_count,
+        endpoint_quotas={},
+        shared_quota=shared_slots,
+    )
+    data_server.requests = shared_pool
+    admin_server.requests = shared_pool
+
+    data_server.prepare()
+    admin_server.prepare()
+    # the bound addresses are only known once the servers prepared
+    shared_pool.endpoint_quotas[data_server.bind_addr] = data_reserved
+    shared_pool.endpoint_quotas[admin_server.bind_addr] = admin_reserved
+
+    serve_threads = [
+        threading.Thread(target=server.serve, daemon=True)
+        for server in (data_server, admin_server)
+    ]
+    for serve_thread in serve_threads:
+        serve_thread.start()
+
+    def stop_servers():
+        unblock_data.set()
+        data_server.stop()
+        admin_server.stop()
+
+    request.addfinalizer(stop_servers)
+
+    data_url = 'http://{}:{}/'.format(*data_server.bind_addr)
+    admin_url = 'http://{}:{}/'.format(*admin_server.bind_addr)
+
+    data_responses = []
+
+    def fetch_data():
+        data_responses.append(requests.get(data_url, timeout=30))
+
+    # saturate the data endpoint's reserved and shared execution slots
+    data_threads = [
+        threading.Thread(target=fetch_data, daemon=True)
+        for _ in range(data_capacity)
+    ]
+    for data_thread in data_threads:
+        data_thread.start()
+    assert data_saturated.wait(timeout=10)
+
+    # one more data connection is accepted but parked: queued
+    # connections do not count as executing
+    parked_data_thread = threading.Thread(target=fetch_data, daemon=True)
+    parked_data_thread.start()
+    for _ in range(100):
+        if shared_pool._quota_waiting:
+            break
+        time.sleep(0.1)
+    assert len(shared_pool._quota_waiting) == 1
+    with data_active_lock:
+        assert data_active == data_capacity
+
+    # the admin endpoint still has its reserved capacity: the request
+    # enters the handler while all data slots stay occupied
+    with requests.Session() as admin_session:
+        first_response = admin_session.get(admin_url, timeout=10)
+        assert admin_handler_entered.is_set()
+        assert first_response.status_code == HTTPStatus.OK
+        assert first_response.text == 'admin'
+        # a keep-alive connection re-joins the scheduling for the next
+        # request instead of permanently holding its slot
+        second_response = admin_session.get(admin_url, timeout=10)
+        assert second_response.status_code == HTTPStatus.OK
+        assert second_response.text == 'admin'
+
+    with data_active_lock:
+        assert data_active == data_capacity
+
+    # releasing the data requests lets the parked connection through
+    unblock_data.set()
+    for data_thread in [*data_threads, parked_data_thread]:
+        data_thread.join(timeout=10)
+    assert len(data_responses) == data_capacity + 1
+    assert all(
+        response.status_code == HTTPStatus.OK
+        for response in data_responses
+    )
 
 
 def test_overload_results_in_suitable_http_error(request):

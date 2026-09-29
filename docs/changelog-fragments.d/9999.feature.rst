@@ -1,0 +1,10 @@
+Added optional per-listening-endpoint execution quotas to
+:py:class:`~cheroot.workers.threadpool.ThreadPool` via the new
+``endpoint_quotas`` and ``shared_quota`` arguments. When several
+:class:`~cheroot.server.HTTPServer` instances (e.g. an admin and a
+data endpoint) share one thread pool, each endpoint can reserve
+execution capacity that other endpoints cannot borrow, while all
+endpoints may compete for the shared quota. Connections waiting for
+capacity are parked without consuming a slot, keep-alive connections
+re-join the scheduling for every request, and slots are returned when
+connections close, fail, or the pool shrinks or stops.

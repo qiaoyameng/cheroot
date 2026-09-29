@@ -219,8 +219,17 @@ class WorkerThread(threading.Thread):
                 # NOTE: block. They will be treated as fatal and turned
                 # NOTE: into server shutdown requests and then reraised
                 # NOTE: unconditionally.
+                # Return the execution slot before anything else so the
+                # capacity is available again even if closing or
+                # re-queuing the connection fails. This also covers
+                # worker shutdowns happening mid-request.
+                self.server.requests.release(conn)
                 if keep_conn_open:
-                    self.server.put_conn(conn)
+                    # Route the connection back to the server that
+                    # accepted it (relevant when several servers share
+                    # one thread pool). It will re-compete for an
+                    # execution slot on its next request.
+                    conn.server.put_conn(conn)
                 else:
                     conn.close()
                 if is_stats_enabled:
@@ -237,6 +246,14 @@ class ThreadPool:
 
     ThreadPool objects must provide min, get(), put(obj), start()
     and stop(timeout) attributes.
+
+    The pool may optionally limit how many connections per listening
+    endpoint are being executed concurrently, reserving execution
+    capacity for selected endpoints (such as an admin interface) while
+    letting all endpoints compete for a shared quota. Connections that
+    cannot be admitted immediately are parked and do not count as
+    executing; they are dispatched, in arrival order, as soon as
+    execution capacity is returned to the pool.
     """
 
     def __init__(  # pylint: disable=too-many-positional-arguments
@@ -246,6 +263,8 @@ class ThreadPool:
         max=-1,
         accepted_queue_size=-1,
         accepted_queue_timeout=10,
+        endpoint_quotas=None,
+        shared_quota=None,
     ):
         """Initialize HTTP requests queue instance.
 
@@ -258,6 +277,15 @@ class ThreadPool:
                 requests in queue
             accepted_queue_timeout (int): timeout for putting request
                 into queue
+            endpoint_quotas (dict): mapping of listening endpoints
+                (``bind_addr`` values) to the number of execution slots
+                reserved for connections accepted on that endpoint.
+                Reserved slots are never borrowed by other endpoints.
+                The mapping may be updated at runtime; changes take
+                effect for subsequently dispatched connections.
+            shared_quota (int): number of extra execution slots shared
+                between all endpoints once their reserved slots are
+                exhausted. Defaults to 0 when quotas are configured.
 
         :raises ValueError: if the min/max values are invalid
         :raises TypeError: if the max is not an integer or inf
@@ -288,6 +316,21 @@ class ThreadPool:
         self._queue_put_timeout = accepted_queue_timeout
         self.get = self._queue.get
         self._pending_shutdowns = collections.deque()
+        self._init_execution_quotas(endpoint_quotas, shared_quota)
+
+    def _init_execution_quotas(self, endpoint_quotas, shared_quota):
+        """Set up the execution quota bookkeeping."""
+        self.endpoint_quotas = dict(endpoint_quotas or {})
+        self.shared_quota = 0 if shared_quota is None else shared_quota
+        self._quotas_enabled = (
+            endpoint_quotas is not None or shared_quota is not None
+        )
+        self._quota_lock = threading.Lock()
+        # id(conn) -> (conn, 'reserved' | 'shared', endpoint)
+        self._quota_tokens = {}
+        self._reserved_in_use = collections.Counter()
+        self._shared_in_use = 0
+        self._quota_waiting = collections.deque()
 
     def start(self):
         """Start the pool of threads.
@@ -299,6 +342,11 @@ class ThreadPool:
         self.grow(self.min)
 
     @property
+    def started(self):  # noqa: D401; irrelevant for properties
+        """Flag whether the pool has been started. Read-only."""  # noqa: D401
+        return bool(self._threads)
+
+    @property
     def idle(self):  # noqa: D401; irrelevant for properties
         """Number of worker threads which are idle. Read-only."""  # noqa: D401
         idles = len([t for t in self._threads if t.conn is None])
@@ -307,11 +355,114 @@ class ThreadPool:
     def put(self, obj):
         """Put request into queue.
 
+        When execution quotas are configured, a connection is only
+        queued for the workers once it has been granted an execution
+        slot; otherwise it is parked (without consuming any quota)
+        until capacity is returned via :meth:`release`.
+
         Args:
             obj (:py:class:`~cheroot.server.HTTPConnection`): HTTP connection
                 waiting to be processed
+
+        :raises queue.Full: if the connection cannot be queued
         """
-        self._queue.put(obj, block=True, timeout=self._queue_put_timeout)
+        if obj is _SHUTDOWNREQUEST or not self._quotas_enabled:
+            self._queue.put(obj, block=True, timeout=self._queue_put_timeout)
+            return
+        with self._quota_lock:
+            if self._quota_full_locked():
+                raise queue.Full
+            if not self._try_acquire_quota_locked(obj):
+                # Park the connection: queued connections must not
+                # count as executing, so no slot is consumed here.
+                self._quota_waiting.append(obj)
+                return
+        try:
+            self._queue.put(obj, block=True, timeout=self._queue_put_timeout)
+        except queue.Full:
+            self.release(obj)
+            raise
+
+    def _quota_full_locked(self):
+        """Check whether the backlog of waiting connections is full.
+
+        Must be called with :attr:`_quota_lock` held.
+        """
+        maxsize = self._queue.maxsize
+        return maxsize > 0 and (
+            len(self._quota_waiting) + self._queue.qsize() >= maxsize
+        )
+
+    @staticmethod
+    def _connection_endpoint(conn):
+        """Return the listening endpoint the connection arrived on."""
+        return conn.server.bind_addr
+
+    def _try_acquire_quota_locked(self, conn):
+        """Try to grant an execution slot to ``conn``.
+
+        Must be called with :attr:`_quota_lock` held. Reserved slots
+        are only ever used by connections of their own endpoint; the
+        shared slots are used by any endpoint once its reserved slots
+        are exhausted.
+        """
+        endpoint = self._connection_endpoint(conn)
+        if (
+            self._reserved_in_use[endpoint]
+            < self.endpoint_quotas.get(endpoint, 0)
+        ):
+            self._reserved_in_use[endpoint] += 1
+            self._quota_tokens[id(conn)] = (conn, 'reserved', endpoint)
+            return True
+        if self._shared_in_use < self.shared_quota:
+            self._shared_in_use += 1
+            self._quota_tokens[id(conn)] = (conn, 'shared', endpoint)
+            return True
+        return False
+
+    def release(self, conn):
+        """Return the execution slot held by ``conn`` to the pool.
+
+        Connections waiting for capacity are dispatched, in arrival
+        order, as slots are returned. Connections holding no slot are
+        ignored, so it is always safe to call this when a connection
+        is done being processed.
+
+        Args:
+            conn (:py:class:`~cheroot.server.HTTPConnection`): HTTP
+                connection whose processing finished
+        """
+        if not self._quotas_enabled:
+            return
+        with self._quota_lock:
+            token = self._quota_tokens.pop(id(conn), None)
+            if token is None:
+                return
+            _conn, kind, endpoint = token
+            if kind == 'reserved':
+                self._reserved_in_use[endpoint] -= 1
+                if not self._reserved_in_use[endpoint]:
+                    del self._reserved_in_use[endpoint]
+            else:
+                self._shared_in_use -= 1
+            promoted = []
+            still_waiting = collections.deque()
+            for waiting_conn in self._quota_waiting:
+                if self._try_acquire_quota_locked(waiting_conn):
+                    promoted.append(waiting_conn)
+                else:
+                    still_waiting.append(waiting_conn)
+            self._quota_waiting = still_waiting
+        for waiting_conn in promoted:
+            try:
+                self._queue.put(
+                    waiting_conn,
+                    block=True,
+                    timeout=self._queue_put_timeout,
+                )
+            except queue.Full:
+                self.release(waiting_conn)
+                waiting_conn.close()
 
     def _clear_dead_threads(self):
         # Remove any dead threads from our list
@@ -379,6 +530,15 @@ class ThreadPool:
             endtime = float('inf')
         else:
             endtime = time.time() + timeout
+
+        # Connections parked on quota will never be dispatched;
+        # return their (non-existent) slots and drop them cleanly.
+        if self._quotas_enabled:
+            with self._quota_lock:
+                parked_connections = list(self._quota_waiting)
+                self._quota_waiting.clear()
+            for conn in parked_connections:
+                conn.close()
 
         # Must shut down threads here so the code that calls
         # this method can know when all threads are stopped.

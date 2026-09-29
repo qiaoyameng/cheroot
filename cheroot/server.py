@@ -97,6 +97,7 @@ __all__ = (
     'HTTPServer',
     'HeaderReader',
     'KnownLengthRFile',
+    'MultiListenerHTTPServer',
     'SizeCheckWrapper',
     'get_ssl_adapter_class',
 )
@@ -1812,7 +1813,7 @@ class HTTPServer:
                 self.interrupt = sys_exit_exc
             raise sys_exit_exc from underlying_interrupt
 
-    def prepare(self):  # noqa: C901  # FIXME
+    def prepare(self):
         """Prepare server to serving requests.
 
         It binds a socket's port, setups the socket to ``listen()`` and does
@@ -1825,6 +1826,27 @@ class HTTPServer:
 
         # Select the appropriate socket
         self.socket = None
+        self._create_socket()
+
+        # Timeout so KeyboardInterrupt can be caught on Win32
+        self.socket.settimeout(1)
+        self.socket.listen(self.request_queue_size)
+
+        # must not be accessed once stop() has been called
+        self._connections = connections.ConnectionManager(self)
+
+        # Create worker threads
+        self.requests.start()
+
+        self.ready = True
+        self._start_time = time.time()
+
+    def _create_socket(self):  # noqa: C901  # FIXME
+        """Create the bound listening socket into ``self.socket``.
+
+        May be overridden to adopt an externally supplied socket
+        instead of binding a new one.
+        """
         msg = 'No socket could be created'
         if os.getenv('LISTEN_PID', None):
             # systemd socket activation
@@ -1873,19 +1895,6 @@ class HTTPServer:
 
         if not self.socket:
             raise socket.error(msg)
-
-        # Timeout so KeyboardInterrupt can be caught on Win32
-        self.socket.settimeout(1)
-        self.socket.listen(self.request_queue_size)
-
-        # must not be accessed once stop() has been called
-        self._connections = connections.ConnectionManager(self)
-
-        # Create worker threads
-        self.requests.start()
-
-        self.ready = True
-        self._start_time = time.time()
 
     def _serve_unservicable(self):
         """Serve connections we can't handle a 503."""
@@ -2316,6 +2325,307 @@ class HTTPServer:
 
         self._connections.close()
         self.requests.stop(self.shutdown_timeout)
+
+
+class _AdoptedSocketHTTPServer(HTTPServer):
+    """An HTTP server listening on an externally supplied socket.
+
+    The socket ownership is explicit: owned sockets are closed by
+    :py:meth:`stop`, while borrowed ones are only detached and remain
+    the caller's responsibility.
+    """
+
+    def __init__(self, *args, sock, owns_socket, **kwargs):
+        """Initialize the server around an existing socket."""
+        self._adopted_socket = sock
+        self._owns_adopted_socket = owns_socket
+        super().__init__(*args, **kwargs)
+
+    def _create_socket(self):
+        """Adopt the externally supplied socket instead of binding."""
+        if self._adopted_socket.fileno() < 0:
+            raise RuntimeError(
+                'Cannot prepare a listener from a closed socket. '
+                'Supply a new socket before preparing again.',
+            )
+        self.socket = self._adopted_socket
+        self.bind_addr = self.resolve_real_bind_addr(self._adopted_socket)
+
+    def stop(self):
+        """Stop the server, closing the socket only when it is owned."""
+        if not self._owns_adopted_socket and self.socket is not None:
+            # Detach the borrowed socket so that stop() does not close it.
+            self.socket = None
+        super().stop()
+
+
+class _ListenerSpec:
+    """A single listener endpoint of a multi-listener server."""
+
+    __slots__ = ('bind_addr', 'sock', 'owns_socket')
+
+    def __init__(self, bind_addr=None, sock=None, owns_socket=True):
+        """Record how one listener should obtain its socket."""
+        self.bind_addr = bind_addr
+        self.sock = sock
+        self.owns_socket = owns_socket
+
+
+class MultiListenerHTTPServer:
+    """An HTTP server that listens on several addresses at once.
+
+    The startup is split into two phases:
+
+    * :py:meth:`prepare` resolves the addresses, configures the sockets
+      and validates the TLS adapter, binding every listener. It is
+      all-or-nothing: if any listener cannot be prepared, all the
+      listeners prepared so far are rolled back, so no half-started
+      service is left accepting requests.
+    * :py:meth:`serve` (or the :py:meth:`start` shortcut) starts
+      accepting requests on all the prepared listeners.
+
+    Once :py:meth:`stop` has been called, the server can be prepared
+    again.
+    """
+
+    def __init__(  # pylint: disable=too-many-positional-arguments
+        self,
+        gateway,
+        minthreads=10,
+        maxthreads=-1,
+        server_name=None,
+        ssl_adapter=None,
+        peercreds_enabled=False,
+        peercreds_resolve_enabled=False,
+        reuse_port=False,
+    ):
+        """Initialize a multi-listener HTTP server.
+
+        The arguments mirror :py:class:`HTTPServer` and are shared by
+        all the listeners.
+        """
+        self.gateway = gateway
+        self.minthreads = minthreads
+        self.maxthreads = maxthreads
+        self.server_name = server_name
+        self.ssl_adapter = ssl_adapter
+        self.peercreds_enabled = peercreds_enabled
+        self.peercreds_resolve_enabled = peercreds_resolve_enabled
+        self.reuse_port = reuse_port
+
+        self._listener_specs = []
+        self._servers = []
+        self._serve_threads = []
+        self._prepared = False
+
+    def __str__(self):
+        """Render the server representing its listener addresses."""
+        return '%s.%s(%r)' % (
+            self.__module__,
+            self.__class__.__name__,
+            [
+                spec.bind_addr if spec.sock is None else spec.sock
+                for spec in self._listener_specs
+            ],
+        )
+
+    @property
+    def prepared(self):
+        """Flag indicating that every listener is ready to serve."""
+        return self._prepared
+
+    @property
+    def ready(self):
+        """Flag indicating that every listener is accepting connections."""
+        return self._prepared and all(
+            server.ready for server in self._servers
+        )
+
+    @property
+    def servers(self):
+        """Return the per-listener :py:class:`HTTPServer` instances."""
+        return tuple(self._servers)
+
+    @property
+    def bind_addrs(self):
+        """Return the actual addresses the listeners are bound to."""
+        return tuple(server.bind_addr for server in self._servers)
+
+    def add_listener(self, bind_addr):
+        """Add a listener binding ``bind_addr`` during :py:meth:`prepare`.
+
+        The server creates the listening socket and owns it.
+        """
+        self._add_listener_spec(_ListenerSpec(bind_addr=bind_addr))
+
+    def add_socket(self, sock, *, owns_socket):
+        """Add a listener adopting the externally supplied ``sock``.
+
+        ``owns_socket`` must be stated explicitly: when true, the
+        socket is closed on rollback and :py:meth:`stop`; when false,
+        it is only detached and remains the caller's responsibility.
+        """
+        self._add_listener_spec(
+            _ListenerSpec(sock=sock, owns_socket=owns_socket),
+        )
+
+    def _add_listener_spec(self, spec):
+        if self._prepared:
+            raise RuntimeError(
+                'Listeners cannot be added while the server is prepared.',
+            )
+        self._listener_specs.append(spec)
+
+    def prepare(self):
+        """Prepare all listeners, rolling everything back on failure.
+
+        Resolves the addresses, configures the sockets and checks the
+        TLS adapter before binding. If any listener cannot be prepared,
+        every listener prepared so far is stopped again, so no
+        half-started service is left behind.
+        """
+        if self._prepared:
+            raise RuntimeError('The server is already prepared.')
+        if not self._listener_specs:
+            raise RuntimeError('Cannot prepare a server without listeners.')
+
+        self._validate_ssl_adapter()
+
+        prepared_servers = []
+        try:
+            for spec in self._listener_specs:
+                server = self._build_server(spec)
+                try:
+                    server.prepare()
+                except Exception:
+                    self._discard_failed_server(server, spec.owns_socket)
+                    raise
+                prepared_servers.append(server)
+        except Exception:
+            for server in reversed(prepared_servers):
+                with contextlib.suppress(Exception):
+                    server.stop()
+            raise
+
+        self._servers = prepared_servers
+        self._prepared = True
+
+    def serve(self):
+        """Accept requests on all the prepared listeners.
+
+        Blocks until :py:meth:`stop` is called, like
+        :py:meth:`HTTPServer.serve`.
+        """
+        if not self._prepared:
+            raise RuntimeError(
+                'The server must be prepared before serving.',
+            )
+        self._serve_threads = [
+            threading.Thread(
+                target=server.serve,
+                name='%s.%s[%d]' % (
+                    self.__module__,
+                    self.__class__.__name__,
+                    num,
+                ),
+                daemon=True,
+            )
+            for num, server in enumerate(self._servers)
+        ]
+        for serve_thread in self._serve_threads:
+            serve_thread.start()
+        for serve_thread in self._serve_threads:
+            serve_thread.join()
+
+    def start(self):
+        """Prepare the listeners and serve requests forever.
+
+        Shortcut for invoking :py:meth:`prepare` then :py:meth:`serve`.
+        """
+        self.prepare()
+        self.serve()
+
+    def stop(self):
+        """Stop all the listeners.
+
+        The server can be prepared again once it has stopped.
+        """
+        for server in self._servers:
+            with contextlib.suppress(Exception):
+                server.stop()
+        for serve_thread in self._serve_threads:
+            serve_thread.join()
+        self._serve_threads = []
+        self._servers = []
+        self._prepared = False
+
+    def _build_server(self, spec):
+        """Create the per-listener server for one listener spec."""
+        server_class = HTTPServer
+        extra_kwargs = {}
+        if spec.sock is not None:
+            server_class = _AdoptedSocketHTTPServer
+            extra_kwargs = {
+                'sock': spec.sock,
+                'owns_socket': spec.owns_socket,
+            }
+            bind_addr = HTTPServer.resolve_real_bind_addr(spec.sock)
+        else:
+            bind_addr = spec.bind_addr
+        server = server_class(
+            bind_addr=bind_addr,
+            gateway=self.gateway,
+            minthreads=self.minthreads,
+            maxthreads=self.maxthreads,
+            server_name=self.server_name,
+            peercreds_enabled=self.peercreds_enabled,
+            peercreds_resolve_enabled=self.peercreds_resolve_enabled,
+            reuse_port=self.reuse_port,
+            **extra_kwargs,
+        )
+        server.ssl_adapter = self.ssl_adapter
+        return server
+
+    @staticmethod
+    def _discard_failed_server(server, owns_socket):
+        """Clean up a server whose :py:meth:`prepare` failed midway.
+
+        ``HTTPServer.stop()`` returns immediately when the server never
+        became ready, so the resources are released directly here.
+        """
+        with contextlib.suppress(Exception):
+            server.requests.stop(server.shutdown_timeout)
+        sock = getattr(server, 'socket', None)
+        server.socket = None
+        if sock is not None and owns_socket:
+            with contextlib.suppress(OSError):
+                sock.close()
+
+    def _validate_ssl_adapter(self):
+        """Check the TLS adapter before any socket is bound."""
+        adapter = self.ssl_adapter
+        if adapter is None:
+            return
+        missing_attrs = [
+            attr
+            for attr in ('wrap', 'makefile')
+            if not callable(getattr(adapter, attr, None))
+        ]
+        if missing_attrs:
+            raise TypeError(
+                'The ssl_adapter must provide callable %s.'
+                % ', '.join(missing_attrs),
+            )
+        try:
+            context = adapter.context
+        except AttributeError:
+            # Duck-typed adapters without a context are fine.
+            pass
+        else:
+            if context is None:
+                raise ValueError(
+                    'The ssl_adapter has no TLS context configured.',
+                )
 
 
 class Gateway:

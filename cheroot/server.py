@@ -79,11 +79,12 @@ import threading
 import time
 import traceback as traceback_
 import urllib.parse
+from collections.abc import Mapping
 from functools import lru_cache
 from warnings import warn as _warn
 
 from . import __version__, connections, errors
-from ._compat import IS_PPC, bton
+from ._compat import IS_PPC, bton, ntob
 from .makefile import MakeFile, StreamWriter
 from .workers import threadpool
 
@@ -97,6 +98,7 @@ __all__ = (
     'HTTPServer',
     'HeaderReader',
     'KnownLengthRFile',
+    'RequestTrailers',
     'SizeCheckWrapper',
     'get_ssl_adapter_class',
 )
@@ -192,6 +194,61 @@ comma_separated_headers = [
     b'Warning',
     b'WWW-Authenticate',
 ]
+
+
+prohibited_trailer_headers = frozenset(
+    {
+        # Message framing (message boundaries must not be
+        # influenced by trailer fields)
+        b'content-length',
+        b'transfer-encoding',
+        b'trailer',
+        # Routing
+        b'host',
+        # Authentication
+        b'authorization',
+        b'proxy-authorization',
+        b'cookie',
+        b'set-cookie',
+        # Request modifiers and conditionals
+        b'cache-control',
+        b'expect',
+        b'if-match',
+        b'if-none-match',
+        b'if-modified-since',
+        b'if-unmodified-since',
+        b'if-range',
+        b'range',
+        # Response control data
+        b'age',
+        b'date',
+        b'expires',
+        b'location',
+        b'retry-after',
+        b'vary',
+        b'warning',
+        # Payload processing
+        b'content-encoding',
+        b'content-language',
+        b'content-range',
+        b'content-type',
+        # Connection state
+        b'connection',
+        b'keep-alive',
+        b'proxy-authenticate',
+        b'te',
+        b'upgrade',
+        b'www-authenticate',
+    },
+)
+"""Field names that must never be honored from a trailer section.
+
+Follows RFC 9110 sec. 6.5.1, which forbids trailer fields needed for
+message framing, routing, request modifiers, authentication, response
+control data, and payload processing.  Such fields are dropped when
+received in a trailer section so they cannot redefine message
+boundaries, authentication, or routing after the fact.
+"""
 
 
 if not hasattr(logging, 'statistics'):
@@ -474,9 +531,21 @@ class ChunkedRFile:
     :param rfile: file encoded with the 'chunked' transfer encoding
     :param int maxlen: maximum length of the file being read
     :param int bufsize: size of the buffer used to read the file
+    :param trailer_reader: a :py:class:`HeaderReader` instance (or
+        compatible callable) used to parse the trailer section
+    :param declared_trailer_fields: field names (lowercased bytes) the
+        client announced via the ``Trailer`` request header, or
+        :py:data:`None` if no such header was sent
     """
 
-    def __init__(self, rfile, maxlen, bufsize=8192):
+    def __init__(  # noqa: D107
+        self,
+        rfile,
+        maxlen,
+        bufsize=8192,
+        trailer_reader=None,
+        declared_trailer_fields=None,
+    ):
         """Initialize ChunkedRFile instance."""
         self.rfile = rfile
         self.maxlen = maxlen
@@ -484,11 +553,27 @@ class ChunkedRFile:
         self.buffer = EMPTY
         self.bufsize = bufsize
         self.closed = False
+        self.failed = False
+        self.trailer_reader = (
+            HeaderReader() if trailer_reader is None else trailer_reader
+        )
+        self.declared_trailer_fields = declared_trailer_fields
+        self.trailers = None
+        self.trailer_errors = []
 
     def _fetch(self):
         if self.closed:
             return
 
+        try:
+            self._fetch_chunk()
+        except Exception:
+            # The stream can no longer be realigned with the connection,
+            # so the connection must not be reused for another request.
+            self.failed = True
+            raise
+
+    def _fetch_chunk(self):
         line = self.rfile.readline()
         self.bytes_read += len(line)
 
@@ -510,12 +595,16 @@ class ChunkedRFile:
 
         if chunk_size <= 0:
             self.closed = True
+            self._read_trailers()
             return
 
         # if line: chunk_extension = line[0]
 
         if self.maxlen and self.bytes_read + chunk_size > self.maxlen:
-            raise IOError('Request Entity Too Large')
+            raise errors.MaxSizeExceeded(
+                'Request Entity Too Large',
+                self.maxlen,
+            )
 
         chunk = self.rfile.read(chunk_size)
         self.bytes_read += len(chunk)
@@ -642,7 +731,10 @@ class ChunkedRFile:
 
             self.bytes_read += len(line)
             if self.maxlen and self.bytes_read > self.maxlen:
-                raise IOError('Request Entity Too Large')
+                raise errors.MaxSizeExceeded(
+                    'Request Entity Too Large',
+                    self.maxlen,
+                )
 
             if line == CRLF:
                 # Normal end of headers
@@ -652,9 +744,134 @@ class ChunkedRFile:
 
             yield line
 
+    def _read_trailers(self):
+        """Read, filter, and store the trailer section.
+
+        Runs right after the terminal (zero-length) chunk has been
+        validated, consuming the trailer section from the connection so
+        that keep-alive requests following this one stay aligned.
+
+        Fields listed in :py:data:`prohibited_trailer_headers` (message
+        framing, routing, authentication, and friends) are discarded so
+        they cannot redefine message boundaries, authentication, or
+        routing after the fact.  When the client sent a ``Trailer``
+        request header, fields it did not declare are discarded as
+        well.  Every discarded field is recorded in
+        :py:attr:`trailer_errors`; fields the client declared but never
+        sent are not an error.  The surviving fields are stored in
+        :py:attr:`trailers`, with duplicates folded according to the
+        same rules as regular headers.
+        """
+        parsed = self.trailer_reader(
+            _TrailerSectionReader(self.read_trailer_lines()),
+        )
+        trailers = {}
+        for name, value in parsed.items():
+            if name.lower() in prohibited_trailer_headers:
+                self.trailer_errors.append(
+                    f'Prohibited trailer field dropped: {bton(name)}',
+                )
+                continue
+            if (
+                self.declared_trailer_fields is not None
+                and name.lower() not in self.declared_trailer_fields
+            ):
+                self.trailer_errors.append(
+                    f'Undeclared trailer field dropped: {bton(name)}',
+                )
+                continue
+            trailers[name] = value
+        self.trailers = trailers
+
     def close(self):
         """Release resources allocated for ``rfile``."""
         self.rfile.close()
+
+
+class _TrailerSectionReader:
+    """Adapt a trailer line generator to the ``readline()`` interface.
+
+    Feeds the lines produced by
+    :py:meth:`ChunkedRFile.read_trailer_lines` into a
+    :py:class:`HeaderReader`, re-appending the terminating CRLF that
+    the generator consumes but does not yield.
+    """
+
+    def __init__(self, lines):
+        """Initialize the adapter with an iterator of header lines."""
+        self._lines = iter(lines)
+        self._exhausted = False
+
+    def readline(self, size=None):
+        """Return the next trailer line, CRLF at the end, then empty."""
+        if self._exhausted:
+            return EMPTY
+        try:
+            return next(self._lines)
+        except StopIteration:
+            self._exhausted = True
+            return CRLF
+
+
+class RequestTrailers(Mapping):
+    """A read-only, lazily populated view of HTTP request trailer fields.
+
+    Trailer fields become accessible only once the request body has
+    been consumed in full and the terminal chunk validated; any access
+    before that raises :py:exc:`RuntimeError`.  The mapping is
+    independent of the regular request headers: a field of the same
+    name sent in the header section never overrides the trailer value,
+    and vice versa.
+
+    Keys are field names as normalized by :py:class:`HeaderReader`
+    (title-cased); lookups are case-insensitive.  Both keys and values
+    are text strings decoded as ISO-8859-1, matching the WSGI environ
+    convention.
+    """
+
+    def __init__(self, rfile):
+        """Initialize the view over the given :py:class:`ChunkedRFile`."""
+        self._rfile = rfile
+
+    def _resolved(self):
+        trailers = self._rfile.trailers
+        if trailers is None:
+            raise RuntimeError(
+                'Trailer fields are unavailable until the request body '
+                'has been fully consumed.',
+            )
+        return trailers
+
+    @property
+    def errors(self):
+        """Policy violations reported while filtering trailer fields.
+
+        Returns a tuple of messages describing trailer fields that were
+        dropped (prohibited fields, or fields not declared via the
+        ``Trailer`` request header).  Empty until the request body has
+        been fully consumed.
+        """
+        return tuple(self._rfile.trailer_errors)
+
+    def __getitem__(self, key):
+        """Return the trailer field value for ``key``."""
+        return bton(self._resolved()[ntob(key).strip().title()])
+
+    def __iter__(self):
+        """Iterate over the trailer field names."""
+        return (bton(name) for name in self._resolved())
+
+    def __len__(self):
+        """Return the number of trailer fields."""
+        return len(self._resolved())
+
+    def __repr__(self):
+        """Return a representation of the trailer view."""
+        try:
+            trailers = dict(self)
+        except RuntimeError:
+            return f'<{self.__class__.__name__} (unavailable)>'
+        return f'<{self.__class__.__name__} {trailers!r}>'
 
 
 class HTTPRequest:
@@ -689,6 +906,13 @@ class HTTPRequest:
     """If True, output will be encoded with the "chunked" transfer-coding.
 
     This value is set automatically inside send_headers."""
+
+    trailers = None
+    """A :py:class:`RequestTrailers` view of the request trailer fields.
+
+    Set for requests with a chunked transfer-coded body; remains
+    :py:data:`None` otherwise.
+    """
 
     header_reader = HeaderReader()
     """
@@ -1095,7 +1319,12 @@ class HTTPRequest:
         """Call the gateway and write its iterable output."""
         mrbs = self.server.max_request_body_size
         if self.chunked_read:
-            self.rfile = ChunkedRFile(self.conn.rfile, mrbs)
+            self.rfile = ChunkedRFile(
+                self.conn.rfile,
+                mrbs,
+                declared_trailer_fields=self._declared_trailer_fields(),
+            )
+            self.trailers = RequestTrailers(self.rfile)
         else:
             cl = int(self.inheaders.get(b'Content-Length', 0))
             if mrbs and mrbs < cl:
@@ -1108,11 +1337,41 @@ class HTTPRequest:
                 return
             self.rfile = KnownLengthRFile(self.conn.rfile, cl)
 
-        self.server.gateway(self).respond()
+        try:
+            self.server.gateway(self).respond()
+        except errors.MaxSizeExceeded:
+            # The request body exceeded the configured limit while the
+            # application was reading it.  The connection cannot be
+            # realigned, so it must not be reused.
+            self.close_connection = True
+            if not self.sent_headers:
+                self.simple_response(
+                    '413 Request Entity Too Large',
+                    'The entity sent with the request exceeds the '
+                    'maximum allowed bytes.',
+                )
+            return
         self.ready and self.ensure_headers_sent()
 
         if self.chunked_write:
             self.conn.wfile.write(b'0\r\n\r\n')
+
+    def _declared_trailer_fields(self):
+        """Return the field names announced via the ``Trailer`` header.
+
+        Returns a frozenset of lowercased byte strings, or
+        :py:data:`None` when the client did not send a ``Trailer``
+        request header (in which case any non-prohibited trailer field
+        is accepted).
+        """
+        trailer_header = self.inheaders.get(b'Trailer')
+        if trailer_header is None:
+            return None
+        return frozenset(
+            name.strip().lower()
+            for name in trailer_header.split(b',')
+            if name.strip()
+        )
 
     def simple_response(self, status, msg=''):
         """Write a simple response back to the client."""
@@ -1156,6 +1415,25 @@ class HTTPRequest:
         if not self.sent_headers:
             self.sent_headers = True
             self.send_headers()
+
+    def _consume_chunked_remainder(self):
+        """Consume the rest of a chunked request body and its trailers.
+
+        Used when the application finished responding without reading
+        the request body to its end, so that a keep-alive connection
+        stays aligned for the next request.  Any failure (oversized,
+        malformed, or unreadable remaining data) means the stream
+        cannot be realigned, in which case the connection is closed
+        instead of being reused.
+        """
+        if self.rfile.failed:
+            self.close_connection = True
+            return
+        try:
+            while self.rfile.read(65536):
+                pass
+        except (errors.MaxSizeExceeded, ValueError, OSError):
+            self.close_connection = True
 
     def write(self, chunk):
         """Write unbuffered data to the client."""
@@ -1203,6 +1481,30 @@ class HTTPRequest:
             can_keep = self.server.can_add_keepalive_connection
             self.close_connection = not can_keep
 
+        if not self.close_connection:
+            # Read any remaining request body data on the socket.
+            # "If an origin server receives a request that does not include an
+            # Expect request-header field with the "100-continue" expectation,
+            # the request includes a request body, and the server responds
+            # with a final status code before reading the entire request body
+            # from the transport connection, then the server SHOULD NOT close
+            # the transport connection until it has read the entire request,
+            # or until the client closes the connection. Otherwise, the client
+            # might not reliably receive the response message. However, this
+            # requirement is not be construed as preventing a server from
+            # defending itself against denial-of-service attacks, or from
+            # badly broken client implementations."
+            # This runs before the Connection header is decided upon so
+            # that a failure to consume the rest of the request (which
+            # forbids reusing the connection) is still signaled to the
+            # client.
+            if self.chunked_read:
+                self._consume_chunked_remainder()
+            else:
+                remaining = getattr(self.rfile, 'remaining', 0)
+                if remaining > 0:
+                    self.rfile.read(remaining)
+
         if b'connection' not in hkeys:
             if self.response_protocol == 'HTTP/1.1':
                 # Both server and client are HTTP/1.1 or better
@@ -1216,26 +1518,9 @@ class HTTPRequest:
             self.outheaders.append(
                 (
                     b'Keep-Alive',
-                    f'timeout={self.server.timeout}'.encode('ISO-8859-1'),
+                f'timeout={self.server.timeout}'.encode('ISO-8859-1'),
                 ),
             )
-
-        if (not self.close_connection) and (not self.chunked_read):
-            # Read any remaining request body data on the socket.
-            # "If an origin server receives a request that does not include an
-            # Expect request-header field with the "100-continue" expectation,
-            # the request includes a request body, and the server responds
-            # with a final status code before reading the entire request body
-            # from the transport connection, then the server SHOULD NOT close
-            # the transport connection until it has read the entire request,
-            # or until the client closes the connection. Otherwise, the client
-            # might not reliably receive the response message. However, this
-            # requirement is not be construed as preventing a server from
-            # defending itself against denial-of-service attacks, or from
-            # badly broken client implementations."
-            remaining = getattr(self.rfile, 'remaining', 0)
-            if remaining > 0:
-                self.rfile.read(remaining)
 
         if b'date' not in hkeys:
             self.outheaders.append(

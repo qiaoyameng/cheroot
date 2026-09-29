@@ -13,8 +13,6 @@ from re import match as _matches_pattern
 
 import pytest
 
-from jaraco.text import trim, unwrap
-
 import cheroot.server
 from cheroot._compat import IS_CI, IS_MACOS, IS_PYPY, IS_WINDOWS
 from cheroot.test import helper, webtest
@@ -61,6 +59,34 @@ class WSGICallables:
             )
         input_contents = req.environ['wsgi.input'].read().decode('utf-8')
         return f"thanks for '{input_contents!s}'"
+
+    @staticmethod
+    def read_trailers(req, resp):
+        """Render the trailer fields visible to the app after the body."""
+        body = req.environ['wsgi.input'].read().decode('utf-8')
+        trailers = req.environ.get('cheroot.trailers')
+        if trailers is None:
+            return 'no-trailers'
+        return '|'.join(
+            (
+                f'body={body}',
+                f'checksum={trailers.get("X-Checksum", "")}',
+                f'header_checksum={req.environ.get("HTTP_X_CHECKSUM", "")}',
+                f'errors={";".join(trailers.errors)}',
+            )
+        )
+
+    @staticmethod
+    def trailers_before_read(req, resp):
+        """Check whether trailers are available before reading the body."""
+        trailers = req.environ.get('cheroot.trailers')
+        if trailers is None:
+            return 'no-trailers'
+        try:
+            trailers['X-Checksum']
+        except RuntimeError:
+            return 'unavailable'
+        return 'available'
 
     @staticmethod
     def custom_204(req, resp):
@@ -118,6 +144,8 @@ class Controller(helper.Controller):
         '/page3': WSGICallables.pov,
         '/stream': WSGICallables.stream,
         '/upload': WSGICallables.upload,
+        '/read_trailers': WSGICallables.read_trailers,
+        '/trailers_before_read': WSGICallables.trailers_before_read,
         '/custom/204': WSGICallables.custom_204,
         '/custom/304': WSGICallables.custom_304,
         '/err_before_read': WSGICallables.err_before_read,
@@ -1356,15 +1384,6 @@ def test_No_Message_Body(test_client):
     http_connection.close()
 
 
-@pytest.mark.xfail(
-    reason=unwrap(
-        trim("""
-        Headers from earlier request leak into the request
-        line for a subsequent request, resulting in 400
-        instead of 413. See cherrypy/cheroot#69 for details.
-        """),
-    ),
-)
 def test_Chunked_Encoding(test_client):
     """Test HTTP uploads with chunked transfer-encoding."""
     # Initialize a persistent HTTP connection
@@ -1409,6 +1428,159 @@ def test_Chunked_Encoding(test_client):
     status_line, _actual_headers, actual_resp_body = webtest.shb(response)
     actual_status = int(status_line[:3])
     assert actual_status == 413
+    conn.close()
+
+
+def test_chunked_trailers_exposed_to_app(test_client):
+    """Trailer fields reach the app once the body is fully consumed."""
+    conn = test_client.get_connection()
+
+    body = (
+        b'5\r\nhello\r\n'
+        b'6\r\n world\r\n'
+        b'0\r\n'
+        b'X-Checksum: from-trailer\r\n'
+        b'\r\n'
+    )
+    conn.putrequest('POST', '/read_trailers', skip_host=True)
+    conn.putheader('Host', conn.host)
+    conn.putheader('Transfer-Encoding', 'chunked')
+    conn.putheader('Trailer', 'X-Checksum')
+    # A regular header of the same name must not override the trailer.
+    conn.putheader('X-Checksum', 'from-header')
+    conn.endheaders()
+    conn.send(body)
+    response = conn.getresponse()
+    status_line, _actual_headers, actual_resp_body = webtest.shb(response)
+    actual_status = int(status_line[:3])
+    assert actual_status == 200
+    assert actual_resp_body == (
+        b'body=hello world'
+        b'|checksum=from-trailer'
+        b'|header_checksum=from-header'
+        b'|errors='
+    )
+
+    # The trailer section was consumed, so the connection stays usable.
+    status_line, _actual_headers, actual_resp_body = test_client.get(
+        '/hello',
+        http_conn=conn,
+    )
+    actual_status = int(status_line[:3])
+    assert actual_status == 200
+    assert actual_resp_body == b'Hello, world!'
+    conn.close()
+
+
+def test_chunked_trailers_unavailable_before_body_read(test_client):
+    """Trailer access before consuming the body raises RuntimeError."""
+    conn = test_client.get_connection()
+
+    body = b'5\r\nhello\r\n0\r\nX-Checksum: abc\r\n\r\n'
+    conn.putrequest('POST', '/trailers_before_read', skip_host=True)
+    conn.putheader('Host', conn.host)
+    conn.putheader('Transfer-Encoding', 'chunked')
+    conn.putheader('Trailer', 'X-Checksum')
+    conn.endheaders()
+    conn.send(body)
+    response = conn.getresponse()
+    status_line, _actual_headers, actual_resp_body = webtest.shb(response)
+    actual_status = int(status_line[:3])
+    assert actual_status == 200
+    assert actual_resp_body == b'unavailable'
+    conn.close()
+
+
+def test_chunked_trailers_drained_on_early_response(test_client):
+    """The server consumes an unread chunked body and its trailers.
+
+    A keep-alive connection must stay aligned for the next request.
+    """
+    conn = test_client.get_connection()
+
+    # /hello never reads the request body.
+    body = b'5\r\nhello\r\n0\r\nX-Checksum: abc\r\n\r\n'
+    conn.putrequest('POST', '/hello', skip_host=True)
+    conn.putheader('Host', conn.host)
+    conn.putheader('Transfer-Encoding', 'chunked')
+    conn.putheader('Trailer', 'X-Checksum')
+    conn.endheaders()
+    conn.send(body)
+    response = conn.getresponse()
+    status_line, actual_headers, _actual_resp_body = webtest.shb(response)
+    actual_status = int(status_line[:3])
+    assert actual_status == 200
+    assert not header_exists('Connection', actual_headers)
+
+    status_line, _actual_headers, actual_resp_body = test_client.get(
+        '/hello',
+        http_conn=conn,
+    )
+    actual_status = int(status_line[:3])
+    assert actual_status == 200
+    assert actual_resp_body == b'Hello, world!'
+    conn.close()
+
+
+def test_chunked_trailer_policy_reporting(test_client):
+    """Prohibited and undeclared trailer fields are dropped+reported."""
+    conn = test_client.get_connection()
+
+    body = (
+        b'5\r\nhello\r\n'
+        b'0\r\n'
+        b'X-Checksum: abc\r\n'
+        b'Content-Length: 99\r\n'
+        b'Host: evil.example\r\n'
+        b'X-Undeclared: z\r\n'
+        b'\r\n'
+    )
+    conn.putrequest('POST', '/read_trailers', skip_host=True)
+    conn.putheader('Host', conn.host)
+    conn.putheader('Transfer-Encoding', 'chunked')
+    conn.putheader('Trailer', 'X-Checksum')
+    conn.endheaders()
+    conn.send(body)
+    response = conn.getresponse()
+    status_line, _actual_headers, actual_resp_body = webtest.shb(response)
+    actual_status = int(status_line[:3])
+    assert actual_status == 200
+    assert actual_resp_body == (
+        b'body=hello'
+        b'|checksum=abc'
+        b'|header_checksum='
+        b'|errors=Prohibited trailer field dropped: Content-Length'
+        b';Prohibited trailer field dropped: Host'
+        b';Undeclared trailer field dropped: X-Undeclared'
+    )
+
+    # Dropping fields does not corrupt the connection either.
+    status_line, _actual_headers, _actual_resp_body = test_client.get(
+        '/hello',
+        http_conn=conn,
+    )
+    actual_status = int(status_line[:3])
+    assert actual_status == 200
+    conn.close()
+
+
+def test_chunked_trailer_parse_failure_closes_connection(test_client):
+    """A malformed trailer section makes the connection non-reusable."""
+    conn = test_client.get_connection()
+
+    # /hello never reads the request body, so the server drains it and
+    # runs into the malformed trailer line itself.
+    body = b'5\r\nhello\r\n0\r\nnot a header line\r\n\r\n'
+    conn.putrequest('POST', '/hello', skip_host=True)
+    conn.putheader('Host', conn.host)
+    conn.putheader('Transfer-Encoding', 'chunked')
+    conn.endheaders()
+    conn.send(body)
+    response = conn.getresponse()
+    status_line, actual_headers, _actual_resp_body = webtest.shb(response)
+    actual_status = int(status_line[:3])
+    assert actual_status == 200
+    assert header_has_value('Connection', 'close', actual_headers)
     conn.close()
 
 

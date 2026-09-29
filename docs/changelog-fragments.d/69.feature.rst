@@ -1,0 +1,18 @@
+Added read-only support for HTTP request trailer fields.  When a
+request arrives with a chunked transfer-coded body, the trailer
+section is parsed once the body has been fully consumed and the
+terminal chunk validated, and is exposed to WSGI applications through
+the ``cheroot.trailers`` environ entry — a read-only mapping that
+raises :py:exc:`RuntimeError` on any earlier access.  Fields needed
+for message framing, routing, or authentication (per RFC 9110 sec.
+6.5.1) are discarded, as are fields the client did not announce via
+the ``Trailer`` request header; every discarded field is reported
+through the mapping's ``errors`` property.  Trailer fields never
+merge into the regular ``HTTP_*`` environ entries, so same-named
+headers and trailers stay independent.
+
+The server now also drains an unread chunked request body (including
+its trailer section) before reusing a keep-alive connection, and
+refuses to reuse the connection when the remaining body or trailer
+section cannot be consumed — fixing trailer bytes leaking into the
+next request's parse (issue `#69`).

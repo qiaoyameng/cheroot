@@ -317,6 +317,16 @@ class Gateway_10(Gateway):
         if cl is not None:
             env['CONTENT_LENGTH'] = cl
 
+        if req.chunked_read and req.trailers is not None:
+            # A read-only view of the request trailer fields.  It stays
+            # empty of values (raising RuntimeError on access) until the
+            # application has consumed the request body in full, at
+            # which point the terminal chunk has been validated and the
+            # trailer section parsed.  Trailer fields never merge into
+            # the HTTP_* environ entries, so a regular header of the
+            # same name cannot override them (nor vice versa).
+            env['cheroot.trailers'] = req.trailers
+
         if req.conn.ssl_env:
             env.update(req.conn.ssl_env)
 

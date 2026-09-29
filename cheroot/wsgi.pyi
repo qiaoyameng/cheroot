@@ -24,6 +24,8 @@ class Server(server.HTTPServer):
         peercreds_enabled: bool = ...,
         peercreds_resolve_enabled: bool = ...,
         reuse_port: bool = ...,
+        execution_quota: _t.Any | None = ...,
+        reserved_executions: int = ...,
     ) -> None: ...
     @property
     def numthreads(self): ...

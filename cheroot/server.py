@@ -1619,6 +1619,22 @@ class HTTPServer:
 
     Default is 10. Set to None to have unlimited connections."""
 
+    execution_quota = None
+    """An optional shared execution quota coordinating worker capacity.
+
+    A :py:class:`~cheroot.workers.threadpool.SharedExecutionQuota`
+    instance shared with other endpoints. Must be set before
+    :py:meth:`prepare` is called.
+    """
+
+    reserved_executions = 0
+    """Number of execution slots reserved for this endpoint.
+
+    Only meaningful when :py:attr:`execution_quota` is set. Reserved
+    slots are guaranteed to remain available to this endpoint and can
+    never be borrowed by other endpoints.
+    """
+
     def __init__(  # pylint: disable=too-many-positional-arguments
         self,
         bind_addr,
@@ -1629,6 +1645,8 @@ class HTTPServer:
         peercreds_enabled=False,
         peercreds_resolve_enabled=False,
         reuse_port=False,
+        execution_quota=None,
+        reserved_executions=0,
     ):
         """Initialize HTTPServer instance.
 
@@ -1641,9 +1659,16 @@ class HTTPServer:
                 HTTP header
             reuse_port (bool): if True SO_REUSEPORT option would be set to
                 socket
+            execution_quota: optional
+                :py:class:`~cheroot.workers.threadpool.SharedExecutionQuota`
+                instance shared with other endpoints
+            reserved_executions (int): number of execution slots reserved
+                for this endpoint within the shared quota
         """
         self.bind_addr = bind_addr
         self.gateway = gateway
+        self.execution_quota = execution_quota
+        self.reserved_executions = reserved_executions
 
         self.requests = threadpool.ThreadPool(
             self,
@@ -1880,6 +1905,9 @@ class HTTPServer:
 
         # must not be accessed once stop() has been called
         self._connections = connections.ConnectionManager(self)
+
+        if self.execution_quota is not None:
+            self.execution_quota.register(self, self.reserved_executions)
 
         # Create worker threads
         self.requests.start()
@@ -2315,6 +2343,10 @@ class HTTPServer:
             self.socket = None
 
         self._connections.close()
+        if self.execution_quota is not None:
+            # Wake up workers waiting for an execution slot so they
+            # can drop their connections and shut down.
+            self.execution_quota.unregister(self)
         self.requests.stop(self.shutdown_timeout)
 
 

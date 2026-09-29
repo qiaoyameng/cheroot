@@ -17,7 +17,7 @@ import warnings
 from jaraco.functools import pass_none
 
 
-__all__ = ('ThreadPool', 'WorkerThread')
+__all__ = ('SharedExecutionQuota', 'ThreadPool', 'WorkerThread')
 
 
 class TrueyZero:
@@ -33,6 +33,162 @@ class TrueyZero:
 trueyzero = TrueyZero()
 
 _SHUTDOWNREQUEST = object()
+
+_EXECUTION_ABORTED = object()
+
+
+class _EndpointQuota:
+    """Bookkeeping for a single endpoint registered with a quota."""
+
+    __slots__ = ('reserved', 'reserved_in_use', 'shared_in_use')
+
+    def __init__(self, reserved):
+        self.reserved = reserved
+        self.reserved_in_use = 0
+        self.shared_in_use = 0
+
+
+class _ExecutionPermit:
+    """A token representing one acquired execution slot."""
+
+    __slots__ = ('endpoint', 'shared')
+
+    def __init__(self, endpoint, shared):
+        self.endpoint = endpoint
+        self.shared = shared
+
+
+class SharedExecutionQuota:
+    """Execution capacity shared between multiple server endpoints.
+
+    A single quota instance may be shared by several
+    :py:class:`~cheroot.server.HTTPServer` instances (endpoints) — for
+    example, a data endpoint and a management endpoint listening on
+    different ports. Each endpoint registers a number of *reserved*
+    execution slots that are guaranteed to remain available to that
+    endpoint only — other endpoints can never borrow them. On top of
+    the reserved slots, all endpoints compete for a common pool of
+    *shared* slots, allowing a busy endpoint to borrow spare capacity
+    whenever the other endpoints are idle.
+
+    A slot is only held while a connection is actively being executed
+    by a worker thread; queued connections do not consume any
+    capacity. Slots are returned when a request finishes (keep-alive
+    connections re-enter scheduling for every request instead of
+    holding their slot), when a connection is closed, when an error
+    occurs, and when the worker pool is shrunk or stopped.
+    """
+
+    def __init__(self, shared=0):
+        """Initialize the shared execution quota.
+
+        Args:
+            shared (int): number of execution slots that any registered
+                endpoint may borrow on top of its reserved slots
+
+        :raises ValueError: if the shared slot count is invalid
+        """
+        if shared < 0:
+            raise ValueError(f'shared={shared!s} must be >= 0')
+        self._shared_total = shared
+        self._shared_in_use = 0
+        self._endpoints = {}
+        self._condition = threading.Condition()
+
+    @property
+    def shared(self):
+        """Total number of shared execution slots."""
+        return self._shared_total
+
+    @property
+    def shared_in_use(self):
+        """Number of shared execution slots currently in use."""
+        with self._condition:
+            return self._shared_in_use
+
+    def register(self, endpoint, reserved=0):
+        """Register an endpoint, reserving execution slots for it.
+
+        Args:
+            endpoint: hashable identifier of the endpoint, typically
+                the :py:class:`~cheroot.server.HTTPServer` instance
+            reserved (int): number of execution slots guaranteed to
+                remain available to this endpoint only
+
+        :raises ValueError: if the endpoint is already registered or
+            the reserved slot count is invalid
+        """
+        if reserved < 0:
+            raise ValueError(f'reserved={reserved!s} must be >= 0')
+        with self._condition:
+            if endpoint in self._endpoints:
+                raise ValueError(
+                    f'Endpoint {endpoint!r} is already registered',
+                )
+            self._endpoints[endpoint] = _EndpointQuota(reserved)
+            self._condition.notify_all()
+
+    def unregister(self, endpoint):
+        """Remove an endpoint, waking up its pending workers.
+
+        Permits that are still held by the endpoint remain valid and
+        keep being accounted for until they are released.
+        """
+        with self._condition:
+            self._endpoints.pop(endpoint, None)
+            self._condition.notify_all()
+
+    def reserved(self, endpoint):
+        """Return the number of slots reserved for an endpoint."""
+        with self._condition:
+            state = self._endpoints.get(endpoint)
+            return 0 if state is None else state.reserved
+
+    def in_use(self, endpoint):
+        """Return the number of slots currently used by an endpoint."""
+        with self._condition:
+            state = self._endpoints.get(endpoint)
+            if state is None:
+                return 0
+            return state.reserved_in_use + state.shared_in_use
+
+    def acquire(self, endpoint):
+        """Acquire an execution permit for an endpoint.
+
+        Blocks until a slot is available. Reserved slots of the
+        endpoint are used first; once they are exhausted, shared slots
+        are borrowed.
+
+        Returns:
+            an execution permit to be passed to :py:meth:`release`,
+            or :py:data:`None` if the endpoint is not registered
+            (anymore), signaling the caller to abort
+        """
+        with self._condition:
+            while True:
+                state = self._endpoints.get(endpoint)
+                if state is None:
+                    return None
+                if state.reserved_in_use < state.reserved:
+                    state.reserved_in_use += 1
+                    return _ExecutionPermit(endpoint, shared=False)
+                if self._shared_in_use < self._shared_total:
+                    self._shared_in_use += 1
+                    state.shared_in_use += 1
+                    return _ExecutionPermit(endpoint, shared=True)
+                self._condition.wait()
+
+    def release(self, permit):
+        """Return a previously acquired execution permit."""
+        with self._condition:
+            state = self._endpoints.get(permit.endpoint)
+            if permit.shared:
+                self._shared_in_use -= 1
+                if state is not None:
+                    state.shared_in_use -= 1
+            elif state is not None:
+                state.reserved_in_use -= 1
+            self._condition.notify_all()
 
 
 class WorkerThread(threading.Thread):
@@ -171,6 +327,16 @@ class WorkerThread(threading.Thread):
             if is_stats_enabled:
                 self.start_time = time.time()
             keep_conn_open = False
+            permit = self._acquire_execution_permit()
+            if permit is _EXECUTION_ABORTED:
+                # The endpoint was unregistered from the shared
+                # execution quota (the server is shutting down) while
+                # waiting for a slot — drop the connection.
+                conn.close()
+                if is_stats_enabled:
+                    self.start_time = None
+                self.conn = None
+                continue
             try:  # noqa: WPS243 check "Found too long `finally` block: 3 > 2"
                 keep_conn_open = conn.communicate()
             except ConnectionError as connection_error:
@@ -219,6 +385,7 @@ class WorkerThread(threading.Thread):
                 # NOTE: block. They will be treated as fatal and turned
                 # NOTE: into server shutdown requests and then reraised
                 # NOTE: unconditionally.
+                self._release_execution_permit(permit)
                 if keep_conn_open:
                     self.server.put_conn(conn)
                 else:
@@ -230,6 +397,24 @@ class WorkerThread(threading.Thread):
                     self.work_time += time.time() - self.start_time
                     self.start_time = None
                 self.conn = None
+
+    def _acquire_execution_permit(self):
+        """Acquire an execution permit from the shared quota, if any.
+
+        Blocks until a slot is available for this worker's endpoint.
+        Queued and waiting connections do not count as executing.
+        """
+        quota = getattr(self.server, 'execution_quota', None)
+        if quota is None:
+            return None
+        permit = quota.acquire(self.server)
+        return _EXECUTION_ABORTED if permit is None else permit
+
+    def _release_execution_permit(self, permit):
+        """Return a previously acquired execution permit to the quota."""
+        if permit is None or permit is _EXECUTION_ABORTED:
+            return
+        self.server.execution_quota.release(permit)
 
 
 class ThreadPool:

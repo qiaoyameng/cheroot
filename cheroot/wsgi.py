@@ -54,6 +54,8 @@ class Server(server.HTTPServer):
         peercreds_enabled=False,
         peercreds_resolve_enabled=False,
         reuse_port=False,
+        execution_quota=None,
+        reserved_executions=0,
     ):
         """Initialize WSGI Server instance.
 
@@ -73,6 +75,11 @@ class Server(server.HTTPServer):
                 requests in queue
             accepted_queue_timeout (int): timeout for putting request
                 into queue
+            execution_quota: optional
+                :py:class:`~cheroot.workers.threadpool.SharedExecutionQuota`
+                instance shared with other endpoints
+            reserved_executions (int): number of execution slots reserved
+                for this endpoint within the shared quota
         """
         super(Server, self).__init__(
             bind_addr,
@@ -81,6 +88,8 @@ class Server(server.HTTPServer):
             peercreds_enabled=peercreds_enabled,
             peercreds_resolve_enabled=peercreds_resolve_enabled,
             reuse_port=reuse_port,
+            execution_quota=execution_quota,
+            reserved_executions=reserved_executions,
         )
         self.wsgi_app = wsgi_app
         self.request_queue_size = request_queue_size

@@ -151,6 +151,8 @@ class HTTPServer:
     peercreds_resolve_enabled: bool
     reuse_port: bool
     keep_alive_conn_limit: int
+    execution_quota: _t.Any
+    reserved_executions: int
     requests: _t.Any
     def __init__(
         self,
@@ -162,6 +164,8 @@ class HTTPServer:
         peercreds_enabled: bool = ...,
         peercreds_resolve_enabled: bool = ...,
         reuse_port: bool = ...,
+        execution_quota: _t.Any | None = ...,
+        reserved_executions: int = ...,
     ) -> None: ...
     stats: _t.Any
     def clear_stats(self): ...

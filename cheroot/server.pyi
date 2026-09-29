@@ -9,6 +9,8 @@ __all__ = (
     'HTTPServer',
     'HeaderReader',
     'KnownLengthRFile',
+    'Listener',
+    'MultiListenerServer',
     'SizeCheckWrapper',
     'get_ssl_adapter_class',
 )
@@ -208,6 +210,31 @@ class HTTPServer:
     def interrupt(self): ...
     @interrupt.setter
     def interrupt(self, interrupt) -> None: ...
+    def stop(self) -> None: ...
+
+class Listener:
+    bind_addr: _t.Any
+    socket: _t.Any
+    owned: bool
+    ssl_adapter: _t.Any
+    def __init__(
+        self,
+        bind_addr=None,
+        *,
+        sock=None,
+        owned: bool | None = ...,
+        ssl_adapter=None,
+    ) -> None: ...
+
+class MultiListenerServer:
+    def __init__(self, listeners, gateway, **server_kwargs) -> None: ...
+    @property
+    def ready(self): ...
+    @property
+    def bind_addrs(self): ...
+    def prepare(self) -> None: ...
+    def serve(self) -> None: ...
+    def start(self) -> None: ...
     def stop(self) -> None: ...
 
 class Gateway:

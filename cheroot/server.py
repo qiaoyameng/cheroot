@@ -85,6 +85,7 @@ from warnings import warn as _warn
 from . import __version__, connections, errors
 from ._compat import IS_PPC, bton
 from .makefile import MakeFile, StreamWriter
+from .ssl import Adapter as SSLAdapter
 from .workers import threadpool
 
 
@@ -97,6 +98,8 @@ __all__ = (
     'HTTPServer',
     'HeaderReader',
     'KnownLengthRFile',
+    'Listener',
+    'MultiListenerServer',
     'SizeCheckWrapper',
     'get_ssl_adapter_class',
 )
@@ -1528,6 +1531,12 @@ class HTTPServer:
 
     _bind_addr = '127.0.0.1'
     _interrupt = None
+    _prepared_socket = None
+    """Externally created socket to adopt in prepare() instead of binding.
+
+    Used by :class:`MultiListenerServer` to serve on sockets passed in
+    by the caller. Reset to :py:data:`None` once adopted.
+    """
 
     gateway = None
     """A Gateway instance."""
@@ -1826,7 +1835,12 @@ class HTTPServer:
         # Select the appropriate socket
         self.socket = None
         msg = 'No socket could be created'
-        if os.getenv('LISTEN_PID', None):
+        if self._prepared_socket is not None:
+            # Adopt an externally created, already bound socket
+            self.socket = self._prepared_socket
+            self._prepared_socket = None
+            self.bind_addr = self.resolve_real_bind_addr(self.socket)
+        elif os.getenv('LISTEN_PID', None):
             # systemd socket activation
             self.socket = socket.fromfd(3, socket.AF_INET, socket.SOCK_STREAM)
         elif isinstance(self.bind_addr, (str, bytes)):
@@ -2316,6 +2330,218 @@ class HTTPServer:
 
         self._connections.close()
         self.requests.stop(self.shutdown_timeout)
+
+
+class Listener:
+    """A single listening endpoint of a :class:`MultiListenerServer`.
+
+    A listener either binds its own socket to ``bind_addr`` during
+    :meth:`MultiListenerServer.prepare`, or adopts an externally
+    created ``sock`` whose ownership is declared explicitly.
+    """
+
+    def __init__(
+        self,
+        bind_addr=None,
+        *,
+        sock=None,
+        owned=None,
+        ssl_adapter=None,
+    ):
+        """Initialize a listener specification.
+
+        Args:
+            bind_addr: network interface to listen on, in the same form
+                as :attr:`HTTPServer.bind_addr`.
+            sock: externally created, already bound socket to serve on
+                instead of binding a new one.
+            owned (bool): whether the server takes ownership of ``sock``
+                and closes it on shutdown. Must be passed explicitly
+                when ``sock`` is given.
+            ssl_adapter: optional TLS adapter for this listener,
+                an instance of :class:`cheroot.ssl.Adapter`.
+        """
+        if (bind_addr is None) == (sock is None):
+            raise ValueError(
+                'Pass exactly one of bind_addr or sock.',
+            )
+        if sock is not None and owned is None:
+            raise ValueError(
+                'External sockets require explicit ownership: '
+                'pass owned=True or owned=False.',
+            )
+        if sock is None and owned is not None:
+            raise ValueError(
+                'The owned argument only applies to external sockets.',
+            )
+        self.bind_addr = bind_addr
+        self.socket = sock
+        self.owned = sock is None or owned
+        self.ssl_adapter = ssl_adapter
+
+
+class MultiListenerServer:
+    """An HTTP server listening on several addresses at once.
+
+    All listeners are prepared atomically: address resolution, socket
+    configuration and TLS adapter validation happen in
+    :meth:`prepare`, while incoming connections are only accepted once
+    :meth:`serve` (or :meth:`start`) is invoked. If any listener fails
+    to prepare, the already prepared ones are rolled back, so no
+    half-started listeners are left behind accepting requests.
+
+    After :meth:`stop`, the server may be prepared and started again.
+    """
+
+    def __init__(self, listeners, gateway, **server_kwargs):
+        """Initialize a multi-listener server.
+
+        Args:
+            listeners (list[Listener]): endpoints to listen on.
+            gateway (Gateway): gateway for processing HTTP requests.
+            server_kwargs: extra keyword arguments forwarded to the
+                :class:`HTTPServer` constructor of every listener.
+        """
+        self._listeners = list(listeners)
+        if not self._listeners:
+            raise ValueError('At least one listener is required.')
+        self._gateway = gateway
+        self._server_kwargs = server_kwargs
+        self._servers = []
+
+    def __str__(self):
+        """Render server instance representing its bind addresses."""
+        return '%s.%s(%r)' % (
+            self.__module__,
+            self.__class__.__name__,
+            self.bind_addrs,
+        )
+
+    @property
+    def ready(self):
+        """Whether all listeners are prepared to serve."""
+        return bool(self._servers)
+
+    @property
+    def bind_addrs(self):
+        """Actual bound addresses of the prepared listeners."""
+        return [server.bind_addr for server, _spec in self._servers]
+
+    def prepare(self):
+        """Resolve, configure and bind all listeners atomically.
+
+        TLS adapters are validated before any socket is bound. If
+        binding a listener fails, all previously prepared listeners
+        are shut down again and the error is re-raised.
+        """
+        if self._servers:
+            raise RuntimeError(
+                'Server is already prepared; stop() it before '
+                'preparing it again.',
+            )
+
+        for spec in self._listeners:
+            self._check_ssl_adapter(spec)
+
+        prepared = []
+        try:
+            for spec in self._listeners:
+                prepared.append((self._prepare_server(spec), spec))
+        except Exception:
+            for server, spec in prepared:
+                self._teardown_server(server, spec)
+            raise
+
+        self._servers = prepared
+
+    @staticmethod
+    def _check_ssl_adapter(spec):
+        """Validate the listener's TLS adapter before binding."""
+        adapter = spec.ssl_adapter
+        if adapter is not None and not isinstance(adapter, SSLAdapter):
+            raise TypeError(
+                'ssl_adapter must be an instance of '
+                'cheroot.ssl.Adapter, got %r.' % (adapter,),
+            )
+
+    def _prepare_server(self, spec):
+        """Create and prepare the HTTPServer for one listener."""
+        bind_addr = spec.bind_addr
+        if bind_addr is None:
+            bind_addr = HTTPServer.resolve_real_bind_addr(spec.socket)
+        server = HTTPServer(
+            bind_addr,
+            self._gateway,
+            **self._server_kwargs,
+        )
+        server.ssl_adapter = spec.ssl_adapter
+        if spec.socket is not None:
+            server._prepared_socket = spec.socket
+        try:
+            server.prepare()
+        except Exception:
+            if spec.socket is not None and spec.owned:
+                # The owned socket was handed over to us; don't leak it.
+                with contextlib.suppress(OSError):
+                    spec.socket.close()
+            raise
+        return server
+
+    @staticmethod
+    def _teardown_server(server, spec):
+        """Stop one listener, honoring external socket ownership."""
+        if spec.socket is not None and not spec.owned:
+            # Detach borrowed sockets so stop() leaves them open.
+            server.socket = None
+        server.stop()
+
+    def serve(self):
+        """Accept requests on all prepared listeners.
+
+        Blocks until :meth:`stop` is called. Must be invoked after
+        :meth:`prepare`.
+        """
+        servers = [server for server, _spec in self._servers]
+        if not servers:
+            raise RuntimeError('Cannot serve before prepare().')
+
+        serve_errors = []
+
+        def _serve(server):
+            try:
+                server.serve()
+            except Exception as serve_exc:
+                serve_errors.append(serve_exc)
+
+        threads = [
+            threading.Thread(target=_serve, args=(server,), daemon=True)
+            for server in servers
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        if serve_errors:
+            raise serve_errors[0]
+
+    def start(self):
+        """Prepare all listeners and serve requests forever.
+
+        Shortcut for invoking :meth:`prepare` then :meth:`serve`.
+        """
+        self.prepare()
+        self.serve()
+
+    def stop(self):
+        """Shut down all listeners, closing owned sockets.
+
+        Borrowed external sockets (``owned=False``) are left open.
+        The server may be prepared again afterwards.
+        """
+        servers, self._servers = self._servers, []
+        for server, spec in servers:
+            self._teardown_server(server, spec)
 
 
 class Gateway:

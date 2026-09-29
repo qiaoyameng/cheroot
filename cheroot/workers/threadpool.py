@@ -33,6 +33,7 @@ class TrueyZero:
 trueyzero = TrueyZero()
 
 _SHUTDOWNREQUEST = object()
+_RETIREREQUEST = object()
 
 
 class WorkerThread(threading.Thread):
@@ -42,6 +43,10 @@ class WorkerThread(threading.Thread):
     check its own 'ready' flag after it has started. To stop the thread,
     it is necessary to stick a _SHUTDOWNREQUEST object onto the Queue
     (one for each running WorkerThread).
+
+    When the pool is configured with an idle timeout, a worker that has
+    been idle past that timeout may instead be handed a _RETIREREQUEST
+    by the pool, in which case it exits without being replaced.
     """
 
     conn = None
@@ -162,8 +167,8 @@ class WorkerThread(threading.Thread):
                             server instance
         """
         while True:
-            conn = self.server.requests.get()
-            if conn is _SHUTDOWNREQUEST:
+            conn = self.server.requests._dequeue(self)
+            if conn is _SHUTDOWNREQUEST or conn is _RETIREREQUEST:
                 return
 
             self.conn = conn
@@ -246,6 +251,7 @@ class ThreadPool:
         max=-1,
         accepted_queue_size=-1,
         accepted_queue_timeout=10,
+        idle_timeout=None,
     ):
         """Initialize HTTP requests queue instance.
 
@@ -258,6 +264,9 @@ class ThreadPool:
                 requests in queue
             accepted_queue_timeout (int): timeout for putting request
                 into queue
+            idle_timeout (float): number of seconds after which an idle
+                worker thread retires, shrinking the pool towards
+                ``min``; ``None`` disables auto-scaling
 
         :raises ValueError: if the min/max values are invalid
         :raises TypeError: if the max is not an integer or inf
@@ -280,14 +289,22 @@ class ThreadPool:
                 f'max={max!s} must be > min={min!s} (or infinity for no max)',
             )
 
+        if idle_timeout is not None and idle_timeout <= 0:
+            raise ValueError(f'idle_timeout={idle_timeout!s} must be > 0')
+
         self.server = server
         self.min = min
         self.max = max
+        self._idle_timeout = idle_timeout
         self._threads = []
         self._queue = queue.Queue(maxsize=accepted_queue_size)
         self._queue_put_timeout = accepted_queue_timeout
         self.get = self._queue.get
         self._pending_shutdowns = collections.deque()
+        self._lock = threading.Lock()
+        self._idle_workers = 0
+        # Injectable to allow tests to drive idleness with a fake clock.
+        self._clock = time.monotonic
 
     def start(self):
         """Start the pool of threads.
@@ -312,6 +329,85 @@ class ThreadPool:
                 waiting to be processed
         """
         self._queue.put(obj, block=True, timeout=self._queue_put_timeout)
+        if self._idle_timeout is not None:
+            self._grow_for_backlog()
+
+    def _grow_for_backlog(self):
+        """Spawn workers for queued connections nobody is waiting on.
+
+        Grows the pool (never past ``max``) so that connections queued
+        while every worker is busy get picked up promptly, restoring
+        capacity that was previously surrendered to the idle timeout.
+        """
+        with self._lock:
+            shortage = self._queue.qsize() - self._idle_workers
+            self._grow_locked(shortage)
+
+    def _note_idle(self, delta):
+        """Adjust the count of workers blocked waiting for work."""
+        with self._lock:
+            self._idle_workers += delta
+
+    def _dequeue(self, worker):
+        """Return the next queued connection for ``worker`` to process.
+
+        Blocks until a connection or a shutdown request is available.
+        When an idle timeout is configured and the worker has been idle
+        past it (measured on a monotonic clock), the worker instead
+        retires, provided the pool can spare it; ``_RETIREREQUEST`` is
+        returned in that case.
+
+        Args:
+            worker (WorkerThread): the thread asking for work
+
+        Returns:
+            object: a connection, ``_SHUTDOWNREQUEST`` or
+                ``_RETIREREQUEST``
+        """
+        idle_timeout = self._idle_timeout
+        if idle_timeout is None:
+            return self._queue.get()
+
+        idle_since = self._clock()
+        while True:
+            remaining = idle_timeout - (self._clock() - idle_since)
+            if remaining <= 0:
+                if self._retire_if_expendable(worker):
+                    return _RETIREREQUEST
+                # The pool still needs this worker: keep waiting.
+                idle_since = self._clock()
+                remaining = idle_timeout
+            self._note_idle(1)
+            try:
+                return self._queue.get(timeout=remaining)
+            except queue.Empty:
+                pass  # Re-evaluate idleness against the monotonic clock.
+            finally:
+                self._note_idle(-1)
+
+    def _retire_if_expendable(self, worker):
+        """Remove ``worker`` from the pool if it can be spared.
+
+        The check and the removal are atomic, so the pool never drops
+        below ``min`` threads even if every worker times out at once,
+        and a worker never retires while connections are still queued
+        — a connection arriving concurrently with the decision is
+        either seen here (and the worker stays) or handled by
+        :meth:`_grow_for_backlog` spawning a replacement.
+
+        Args:
+            worker (WorkerThread): the idle thread asking to retire
+
+        Returns:
+            bool: whether the worker was retired and should exit
+        """
+        with self._lock:
+            if len(self._threads) <= self.min:
+                return False
+            if not self._queue.empty():
+                return False
+            self._threads.remove(worker)
+            return True
 
     def _clear_dead_threads(self):
         # Remove any dead threads from our list

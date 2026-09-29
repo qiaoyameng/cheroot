@@ -1,0 +1,7 @@
+The worker :py:class:`~cheroot.workers.threadpool.ThreadPool` now
+supports automatic scaling via the new ``idle_timeout`` argument:
+workers idle for longer than the configured number of seconds retire
+gracefully, never going below ``min`` threads, while incoming bursts
+of queued connections spawn workers back up to ``max``. Idle timing
+uses a monotonic clock and stopping the pool never waits for the idle
+timeout to expire.

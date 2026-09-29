@@ -41,7 +41,9 @@ class WorkerThread(threading.Thread):
     Due to the timing issues of polling a Queue, a WorkerThread does not
     check its own 'ready' flag after it has started. To stop the thread,
     it is necessary to stick a _SHUTDOWNREQUEST object onto the Queue
-    (one for each running WorkerThread).
+    (one for each running WorkerThread). The pool may also hand back
+    _SHUTDOWNREQUEST on its own when an idle worker is retired after
+    exceeding the pool's idle timeout.
     """
 
     conn = None
@@ -237,6 +239,13 @@ class ThreadPool:
 
     ThreadPool objects must provide min, get(), put(obj), start()
     and stop(timeout) attributes.
+
+    The pool scales automatically between ``min`` and ``max`` threads:
+    incoming bursts of connections spawn extra workers (up to ``max``),
+    and workers that stay idle for longer than ``idle_timeout`` seconds
+    retire themselves, never going below ``min`` threads. Idle-time is
+    measured with a monotonic clock, so wall-clock adjustments do not
+    affect the retirement decisions.
     """
 
     def __init__(  # pylint: disable=too-many-positional-arguments
@@ -246,6 +255,7 @@ class ThreadPool:
         max=-1,
         accepted_queue_size=-1,
         accepted_queue_timeout=10,
+        idle_timeout=None,
     ):
         """Initialize HTTP requests queue instance.
 
@@ -258,6 +268,8 @@ class ThreadPool:
                 requests in queue
             accepted_queue_timeout (int): timeout for putting request
                 into queue
+            idle_timeout (int): seconds an idle worker waits for work
+                before retiring (None to keep workers alive forever)
 
         :raises ValueError: if the min/max values are invalid
         :raises TypeError: if the max is not an integer or inf
@@ -280,14 +292,28 @@ class ThreadPool:
                 f'max={max!s} must be > min={min!s} (or infinity for no max)',
             )
 
+        if idle_timeout is not None and idle_timeout < 0:
+            raise ValueError(f'idle_timeout={idle_timeout!s} must be >= 0')
+
         self.server = server
         self.min = min
         self.max = max
+        self.idle_timeout = idle_timeout
         self._threads = []
         self._queue = queue.Queue(maxsize=accepted_queue_size)
         self._queue_put_timeout = accepted_queue_timeout
-        self.get = self._queue.get
         self._pending_shutdowns = collections.deque()
+        # Serializes every decision that changes the number of workers
+        # (manual grow/shrink, backlog-driven growth, idle retirement)
+        # so concurrent deciders cannot over- or under-shoot the bounds.
+        self._membership_lock = threading.Lock()
+        # Monotonic clock used for all idle/shutdown timing. Kept as an
+        # instance attribute so tests can inject a fake clock.
+        self._monotonic = time.monotonic
+        # Upper bound for a single blocking wait on the queue. None means
+        # "wait for the whole remaining idle budget at once"; tests lower
+        # it so a fake clock can be observed advancing in real time.
+        self._idle_poll_interval = None
 
     def start(self):
         """Start the pool of threads.
@@ -304,6 +330,37 @@ class ThreadPool:
         idles = len([t for t in self._threads if t.conn is None])
         return max(idles - len(self._pending_shutdowns), 0)
 
+    def get(self):
+        """Return the next queued connection to process.
+
+        Blocks until a connection is available or the pool decides that
+        the calling worker should terminate, in which case the
+        ``_SHUTDOWNREQUEST`` sentinel is returned. A worker is asked to
+        terminate either because the pool is stopping or—when
+        ``idle_timeout`` is set—because it has been idle for longer than
+        the configured timeout and the pool can spare it.
+        """
+        if self.idle_timeout is None:
+            return self._queue.get()
+
+        deadline = self._monotonic() + self.idle_timeout
+        while True:
+            now = self._monotonic()
+            remaining = deadline - now
+            if remaining <= 0:
+                if self._try_retire():
+                    return _SHUTDOWNREQUEST
+                # The pool is at its minimum (or work is queued): stay
+                # alive and restart the idle countdown.
+                deadline = now + self.idle_timeout
+                remaining = self.idle_timeout
+            if self._idle_poll_interval is not None:
+                remaining = min(remaining, self._idle_poll_interval)
+            try:
+                return self._queue.get(timeout=remaining)
+            except queue.Empty:
+                continue
+
     def put(self, obj):
         """Put request into queue.
 
@@ -312,8 +369,42 @@ class ThreadPool:
                 waiting to be processed
         """
         self._queue.put(obj, block=True, timeout=self._queue_put_timeout)
+        if self.idle_timeout is not None:
+            self._grow_for_backlog()
+
+    def _grow_for_backlog(self):
+        """Spawn extra workers if queued connections outnumber idle ones."""
+        backlog = self._queue.qsize() - self.idle
+        if backlog > 0:
+            self.grow(backlog)
+
+    def _try_retire(self):
+        """Try to reserve a retirement slot for the calling worker.
+
+        The decision is serialized with every other grow/shrink decision,
+        so a herd of simultaneously idle workers cannot all conclude they
+        may exit: only workers above the ``min`` floor retire, one
+        decision at a time. A queued connection arriving concurrently
+        with the decision cannot be lost either—retirement is refused
+        while the queue holds work, and at least ``min`` workers always
+        remain blocked in :meth:`get` to pick up anything enqueued just
+        after the check.
+
+        Returns True when the caller must terminate itself.
+        """
+        with self._membership_lock:
+            self._clear_dead_threads()
+            spare = len(self._threads) - len(self._pending_shutdowns)
+            if spare <= self.min or not self._queue.empty():
+                return False
+            # Account for the caller exactly like a manually shrunk
+            # worker: _clear_dead_threads() will drop the marker once
+            # the thread is gone.
+            self._pending_shutdowns.append(None)
+            return True
 
     def _clear_dead_threads(self):
+        # Callers must hold _membership_lock.
         # Remove any dead threads from our list
         for t in [t for t in self._threads if not t.is_alive()]:
             self._threads.remove(t)
@@ -322,14 +413,16 @@ class ThreadPool:
 
     def grow(self, amount):
         """Spawn new worker threads (not above self.max)."""
-        budget = max(self.max - len(self._threads), 0)
-        n_new = min(amount, budget)
+        with self._membership_lock:
+            self._clear_dead_threads()
+            budget = max(self.max - len(self._threads), 0)
+            n_new = min(amount, budget)
 
-        workers = [self._spawn_worker() for i in range(n_new)]
-        for worker in workers:
-            while not worker.ready:
-                time.sleep(0.1)
-        self._threads.extend(workers)
+            workers = [self._spawn_worker() for i in range(n_new)]
+            for worker in workers:
+                while not worker.ready:
+                    time.sleep(0.1)
+            self._threads.extend(workers)
 
     def _spawn_worker(self):
         worker = WorkerThread(self.server)
@@ -339,25 +432,25 @@ class ThreadPool:
 
     def shrink(self, amount):
         """Kill off worker threads (not below self.min)."""
-        # Grow/shrink the pool if necessary.
-        # Remove any dead threads from our list
-        amount -= len(self._pending_shutdowns)
-        self._clear_dead_threads()
-        if amount <= 0:
-            return
+        with self._membership_lock:
+            # Remove any dead threads from our list
+            amount -= len(self._pending_shutdowns)
+            self._clear_dead_threads()
+            if amount <= 0:
+                return
 
-        # calculate the number of threads above the minimum
-        n_extra = max(len(self._threads) - self.min, 0)
+            # calculate the number of threads above the minimum
+            n_extra = max(len(self._threads) - self.min, 0)
 
-        # don't remove more than amount
-        n_to_remove = min(amount, n_extra)
+            # don't remove more than amount
+            n_to_remove = min(amount, n_extra)
 
-        # put shutdown requests on the queue equal to the number of threads
-        # to remove. As each request is processed by a worker, that worker
-        # will terminate and be culled from the list.
-        for _ in range(n_to_remove):
-            self._pending_shutdowns.append(None)
-            self._queue.put(_SHUTDOWNREQUEST)
+            # put shutdown requests on the queue equal to the number of
+            # threads to remove. As each request is processed by a worker,
+            # that worker will terminate and be culled from the list.
+            for _ in range(n_to_remove):
+                self._pending_shutdowns.append(None)
+                self._queue.put(_SHUTDOWNREQUEST)
 
     def stop(self, timeout=5):
         """Terminate all worker threads.
@@ -378,10 +471,13 @@ class ThreadPool:
         if timeout is None:
             endtime = float('inf')
         else:
-            endtime = time.time() + timeout
+            endtime = self._monotonic() + timeout
 
         # Must shut down threads here so the code that calls
         # this method can know when all threads are stopped.
+        # Idle workers blocked in get() are woken up immediately by
+        # these sentinels; stopping never waits for the idle timeout
+        # to expire first.
         for _worker in self._threads:
             self._queue.put(_SHUTDOWNREQUEST)
 
@@ -394,7 +490,7 @@ class ThreadPool:
         )
 
         for worker in self._clear_threads():
-            remaining_time = timeout and endtime - time.time()
+            remaining_time = timeout and endtime - self._monotonic()
             try:
                 worker.join(remaining_time)
                 if worker.is_alive():
